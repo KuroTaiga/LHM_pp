@@ -144,19 +144,25 @@ def demo_lhmpp(
         motion_name, motion_seqs = get_motion_information(motion_path, cfg, motion_size)
         video_size = len(motion_seqs["motion_seqs"])
 
-        with torch.no_grad():
-            with easy_memory_manager(pose_estimator, device="cuda"):
-                shape_pose = pose_estimator(imgs[0])
-        assert shape_pose.is_full_body, f"The input image is illegal, {shape_pose.msg}"
+        if pose_estimator is not None:
+            with torch.no_grad():
+                with easy_memory_manager(pose_estimator, device="cuda"):
+                    shape_pose = pose_estimator(imgs[0])
+            assert shape_pose.is_full_body, (
+                f"The input image is illegal, {shape_pose.msg}"
+            )
 
         img_np = np.stack(imgs) / 255.0
         ref_imgs_tensor = (
             torch.from_numpy(img_np).permute(0, 3, 1, 2).float().to(device)
         )
         smplx_params = motion_seqs["smplx_params"]
-        smplx_params["betas"] = torch.tensor(
-            shape_pose.beta, dtype=dtype, device=device
-        ).unsqueeze(0)
+        if pose_estimator is not None:
+            smplx_params["betas"] = torch.tensor(
+                shape_pose.beta, dtype=dtype, device=device
+            ).unsqueeze(0)
+        else:
+            smplx_params = smplx_params.copy()
 
         rgbs = inference_results(
             lhmpp,
@@ -253,7 +259,7 @@ def demo_lhmpp(
 
         gr.HTML(
             """<p style="color: #c00; font-size: 0.9em; margin-bottom: 12px; font-weight: 500;">
-            ⚠️ Human images only. Motion video max 1000 frames. LHMPP-700M requires ≥8 GB GPU. Videos may exhibit white occlusion artifacts due to cropping with the original mask, and some motion estimation may have slight jittering.
+            ⚠️ Human images only. Motion video max 1000 frames. Default model LHMPP-700M-SMPLX-FREE requires ≥8 GB GPU. Videos may exhibit white occlusion artifacts due to cropping with the original mask, and some motion estimation may have slight jittering.
             </p>"""
         )
 
@@ -468,9 +474,13 @@ def get_parse() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model_name",
-        default="LHMPP-700M",
+        default="LHMPP-700M-SMPLX-FREE",
         type=str,
-        choices=["LHMPP-700M", "LHMPPS-700M"],  # LHMPP-700MC coming soon
+        choices=[
+            "LHMPP-700M",
+            "LHMPP-700M-SMPLX-FREE",
+            "LHMPPS-700M",
+        ],  # LHMPP-700MC coming soon
         help="Model name",
     )
     parser.add_argument("--debug", action="store_true", help="Debug mode")
@@ -519,20 +529,19 @@ def launch_gradio_app() -> None:
 
     dataset_pipeline = SrcImagePipeline(*processing_list)
 
-    lhmpp: Optional[torch.nn.Module]
-    pose_estimator: Optional[PoseEstimator]
-    lhmpp: Optional[torch.nn.Module]
-    pose_estimator: Optional[PoseEstimator]
     if args.debug:
-        lhmpp: Optional[torch.nn.Module] = None
-        pose_estimator: Optional[PoseEstimator] = None
+        lhmpp = None
+        pose_estimator = None
     else:
         lhmpp = build_app_model(cfg)
         lhmpp.to("cuda")
-        pose_estimator = PoseEstimator(
-            "./pretrained_models/human_model_files/", device="cpu"
-        )
-        pose_estimator.device = "cuda"
+        if cfg.get("use_smplx_shape_estimator", True):
+            pose_estimator = PoseEstimator(
+                "./pretrained_models/human_model_files/", device="cpu"
+            )
+            pose_estimator.device = "cuda"
+        else:
+            pose_estimator = None
 
     demo_lhmpp(lhmpp, pose_estimator, dataset_pipeline, cfg)
 

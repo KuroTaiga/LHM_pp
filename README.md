@@ -18,10 +18,11 @@
 
 #### Model Specifications
 
-| Type | Views | Feat. Dim | Attn. Heads | # GS Points | Encoder Dim. | Service Requirement | Inference Time (1v) | Inference Time (4v) | Inference Time (8v) | Inference Time (16v) |
-|------|-------|------------|-------------|-------------|--------------|---------------------|--------------------|--------------------|--------------------|---------------------|
-| LHMPP-700M | Any | 1024 | 16 | 160,000 | 1024 | 8 GB | 0.79 s | 1.00 s | 1.31 s | 2.13 s |
-| LHMPPS-700M | Any | 1024 | 16 | 160,000 | 1024 | 7.3 GB | 0.79 s | 1.00 s | 1.31 s | 2.13 s |
+| Type | Views | 3DGS-OUTPUT | Feat. Dim | Attn. Heads | # GS Points | Encoder Dim. | Service Requirement | Inference Time (1v) | Inference Time (4v) | Inference Time (8v) | Inference Time (16v) |
+|------|-------|-------------|------------|-------------|-------------|--------------|---------------------|--------------------|--------------------|--------------------|---------------------|
+| LHMPP-700M-SMPLX-FREE | Any | ✓ | 1024 | 16 | 160,000 | 1024 | 8 GB | 0.79 s | 1.00 s | 1.31 s | 2.13 s |
+| LHMPP-700M | Any | — | 1024 | 16 | 160,000 | 1024 | 8 GB | 0.79 s | 1.00 s | 1.31 s | 2.13 s |
+| LHMPPS-700M | Any | — | 1024 | 16 | 160,000 | 1024 | 7.3 GB | 0.79 s | 1.00 s | 1.31 s | 2.13 s |
 
 #### Efficiency Analysis
 
@@ -42,11 +43,14 @@ LHM++ achieves dramatic speedups via the Encoder-Decoder Point-Image Transformer
 If you prefer Chinese documentation, please see the [Chinese README](./README_CN.md).
 ## 📢 Latest Updates
 
+- **LHMPP-700M (updated release):** We released a new LHMPP-700M build that supports **standard 3D Gaussian Splatting PLY (`3GS-PLY`)** as an output format.
+
 ### TODO List
 
 - [x] Core Inference Pipeline🔥🔥🔥
 - [x] Release the codes and pretrained weights
 - [x] HuggingFace Demo Integration 🤗🤗🤗
+- [ ] **Benchmarks:** verify evaluation code and document / release **validation data** for public benchmarks — **NeuMAN**, **Vid2Avatar**, **THuman-2.1**, **In-the-wild Fashion** (**7.1**).
 - [ ] ModelScope Space Online Demo
 - [ ] Release Training data & Testing Data (License Available)
 - [ ] Training Codes Release 

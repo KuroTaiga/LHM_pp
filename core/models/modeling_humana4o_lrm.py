@@ -8,7 +8,6 @@ import importlib
 import math
 import os
 import pdb
-import time
 
 import cv2
 import numpy as np
@@ -32,26 +31,11 @@ from core.models.transformer_block.dpt_decoder import (
     PatchRopeEfficientDPTDecoder,
 )
 from core.models.utils import linear
+from core.models.vggt.heads.shape_head import ShapeHead
 from core.models.vggt_transformer import VGGTAggregator
 from core.modules.embed import PointEmbed
 
 logger = get_logger(__name__)
-
-
-class AverageTimeCalculator:
-    def __init__(self, window_size=10):
-        self.window_size = window_size
-        from collections import deque
-
-        self.times = deque(maxlen=window_size)
-
-    def add_time(self, time_value):
-        self.times.append(time_value)
-
-    def average_time(self):
-        if len(self.times) == 0:
-            return 0.0
-        return sum(self.times) / len(self.times)
 
 
 def scale_intrs(intrs, ratio_x, ratio_y):
@@ -255,6 +239,38 @@ class ModelHumanA4OLRM(nn.Module):
             encoder_feat_dim,  # global feature + frame feature
             **kwargs,
         )
+
+        self.predict_shape_dim = int(
+            kwargs.get("predict_shape_dim", shape_param_dim)
+        )
+        self.use_pred_shape_for_render = bool(
+            kwargs.get("use_pred_shape_for_render", False)
+        )
+        shape_head_cfg = kwargs.get("shape_head")
+        if shape_head_cfg:
+            ib = getattr(self.transformer, "image_backbone", None)
+            if shape_head_cfg.get("dim_in") is not None:
+                shape_head_dim_in = int(shape_head_cfg["dim_in"])
+            elif ib is not None:
+                shape_head_dim_in = ib.embed_dim * (
+                    2 if ib.global_blocks is not None else 1
+                )
+            else:
+                shape_head_dim_in = encoder_feat_dim
+            self.shape_head_num_iterations = int(
+                shape_head_cfg.get("num_iterations", 4)
+            )
+            self.shape_head = ShapeHead(
+                dim_in=shape_head_dim_in,
+                target_dim=self.predict_shape_dim,
+                trunk_depth=int(shape_head_cfg.get("trunk_depth", 4)),
+                num_heads=int(shape_head_cfg.get("num_heads", 16)),
+                mlp_ratio=float(shape_head_cfg.get("mlp_ratio", 4.0)),
+                init_values=float(shape_head_cfg.get("init_values", 0.01)),
+            )
+        else:
+            self.shape_head = None
+            self.shape_head_num_iterations = 0
 
         # motion embedding
         input_dim = self.encoder_feat_dim
@@ -606,6 +622,78 @@ class ModelHumanA4OLRM(nn.Module):
         motion_tokens = self.motion_embed_mlp(motion_tokens).squeeze(1)  # [B, D]
         return motion_tokens
 
+    def _get_shape_token_idx(self) -> int:
+        ib = getattr(self.transformer, "image_backbone", None)
+        if ib is not None:
+            return int(getattr(ib, "shape_token_idx", 0))
+        return 0
+
+    def _pred_shape_from_img_feats(self, img_feats, batch_size: int):
+        """
+        Run ShapeHead on transformer ``img_feats``. Invalid-view tokens are omitted upstream.
+
+        If ``img_feats`` is a list (e.g. dense PI): one tensor per batch index ``b``;
+        ShapeHead mean-pools over views per sample, then concatenates on batch dim to ``[B, D]``.
+
+        If ``img_feats`` is a tensor ``[B, V, P, C]``: mean over ``V`` then one prediction per batch row.
+        """
+        shape_idx = self._get_shape_token_idx()
+        iters = self.shape_head_num_iterations
+
+        if isinstance(img_feats, list):
+            if len(img_feats) == 0:
+                raise ValueError("img_feats is an empty list")
+            if len(img_feats) != batch_size:
+                raise ValueError(
+                    f"img_feats list length ({len(img_feats)}) must match batch_size ({batch_size})"
+                )
+            per_sample_lists = []
+            for b, t in enumerate(img_feats):
+                if not isinstance(t, torch.Tensor):
+                    raise TypeError(
+                        f"img_feats list entries must be torch.Tensor, got {type(t)}"
+                    )
+                per_sample_lists.append(
+                    self.shape_head.forward_from_sequence(
+                        t,
+                        shape_token_idx=shape_idx,
+                        num_iterations=iters,
+                    )
+                )
+            n_stages = len(per_sample_lists[0])
+            pred_shape_list = [
+                torch.cat([per_sample_lists[b][s] for b in range(batch_size)], dim=0)
+                for s in range(n_stages)
+            ]
+            return pred_shape_list[-1], pred_shape_list
+
+        if not isinstance(img_feats, torch.Tensor):
+            raise TypeError(f"img_feats must be Tensor or list, got {type(img_feats)}")
+
+        pred_shape_list = self.shape_head.forward_from_sequence(
+            img_feats,
+            shape_token_idx=shape_idx,
+            num_iterations=iters,
+        )
+        return pred_shape_list[-1], pred_shape_list
+
+    @staticmethod
+    def smplx_params_with_pred_shape_betas(smplx_params: dict, pred_shape: torch.Tensor):
+        """Overwrite leading dimensions of ``betas`` with predicted shape (for rendering)."""
+        if pred_shape is None:
+            return smplx_params
+        out = dict(smplx_params)
+        betas = smplx_params["betas"].clone()
+        d_pred = pred_shape.shape[-1]
+        d_total = betas.shape[-1]
+        if d_pred > d_total:
+            raise ValueError(
+                f"pred_shape dim {d_pred} exceeds smplx betas dim {d_total}"
+            )
+        betas[:, :d_pred] = pred_shape[:, :d_pred]
+        out["betas"] = betas
+        return out
+
     def forward_transformer(
         self, image_feats, query_points, motion_embed=None, **kwargs
     ):
@@ -620,7 +708,7 @@ class ModelHumanA4OLRM(nn.Module):
             torch.Tensor: Transformed features. Shape [B, L, D].
         """
 
-        B = image_feats[-1].shape[0]
+        B = image_feats.shape[0]
 
         if self.latent_query_points_type == "embedding":
             range_ = torch.arange(self.num_pcl, device=image_feats.device)
@@ -689,8 +777,8 @@ class ModelHumanA4OLRM(nn.Module):
             camera (torch.Tensor): Camera tensor of shape [B, D_cam_raw].
             query_points (torch.Tensor, optional): Query points tensor. for example, smplx surface points, Defaults to None.
         Returns:
-            torch.Tensor: Generated tokens tensor.
-            torch.Tensor: Encoded image features tensor.
+            Tuple of ``query_feats``, ``img_feats``, ``motion_embs``, ``pos_embs``,
+            ``pred_shape`` (``[B, D]`` or ``None``), ``pred_shape_list`` (``None`` when no ShapeHead).
         """
 
         def obtain_input_ratio(image):
@@ -740,11 +828,20 @@ class ModelHumanA4OLRM(nn.Module):
             ref_imgs_bool=ref_imgs_bool,
         )
 
+        if self.shape_head is not None:
+            pred_shape, pred_shape_list = self._pred_shape_from_img_feats(
+                results["img_feats"], batch_size=B
+            )
+        else:
+            pred_shape, pred_shape_list = None, None
+
         return (
             results["query_feats"],
             results["img_feats"],
             results["motion_embs"],
             results["pos_embs"],
+            pred_shape,
+            pred_shape_list,
         )
 
     def forward(
@@ -810,19 +907,35 @@ class ModelHumanA4OLRM(nn.Module):
                 device=image.device,
             )
 
-        latent_points, image_feats, motion_emb, pos_emb = self.forward_latent_points(
+        (
+            latent_points,
+            image_feats,
+            motion_emb,
+            pos_emb,
+            pred_shape,
+            pred_shape_list,
+        ) = self.forward_latent_points(
             image,
             camera=None,
             query_points=query_points,
             ref_imgs_bool=kwargs.get("ref_imgs_bool", None),
         )  # [B, N, C]
 
+        use_pred_render = kwargs.get(
+            "use_pred_shape_for_render", self.use_pred_shape_for_render
+        )
+        smplx_for_render = (
+            self.smplx_params_with_pred_shape_betas(smplx_params, pred_shape)
+            if use_pred_render and pred_shape is not None
+            else smplx_params
+        )
+
         # render target views
 
         render_results = self.renderer(
             gs_hidden_features=latent_points,
             query_points=query_points,
-            smplx_data=smplx_params,
+            smplx_data=smplx_for_render,
             c2w=render_c2ws,
             intrinsic=render_intrs,
             height=render_h,
@@ -893,6 +1006,8 @@ class ModelHumanA4OLRM(nn.Module):
             scaling_output=scaling_output,
             opacity_output=opacity_output,
             mesh_meta=render_results["mesh_meta"],
+            pred_shape=pred_shape,
+            pred_shape_list=pred_shape_list,
         )
 
     def obtain_params(self, cfg):
@@ -959,6 +1074,7 @@ class ModelHumanA4OLRM(nn.Module):
         render_bg_colors,
         smplx_params,
         query_pts_path=None,
+        return_pred_shape: bool = False,
         **kwargs,
     ):
         """
@@ -973,13 +1089,14 @@ class ModelHumanA4OLRM(nn.Module):
             render_bg_colors (torch.Tensor): [B, N_source, 3]. BG color for rendering views.
             smplx_params (dict): Parametric human body params (pose, betas, etc).
             query_pts_path (str, optional): Path to query points file (if using predefined queries).
+            return_pred_shape (bool): If True, append ``pred_shape`` to the return tuple.
             **kwargs:
                 ref_imgs_bool (optional): Boolean mask for reference images.
+                use_pred_shape_for_render (optional): Override instance flag for merging predicted shape into betas.
 
         Returns:
-            gs_model_list: List of renderer outputs for the generated renders.
-            query_points: Used query points, possibly e.g. SMPL-X surface or embedding.
-            smplx_params: Possibly modified parametric inputs, after query point processing.
+            Tuple of (gs_model_list, query_points, transform_mat_neutral_pose, latent_points,
+            image_feats, motion_emb, pos_embs); with ``return_pred_shape=True``, ``pred_shape`` is last.
         """
 
         assert (
@@ -997,8 +1114,6 @@ class ModelHumanA4OLRM(nn.Module):
             render_intrs[0, 0, 0, 2] * 2
         )
 
-        torch.cuda.synchronize()
-        print("staring testing")
         query_points = None
 
         if self.latent_query_points_type.startswith(
@@ -1008,31 +1123,38 @@ class ModelHumanA4OLRM(nn.Module):
                 query_pts_path, smplx_params, device=image.device
             )
 
-        time_calculator = AverageTimeCalculator()
-
-        # ********************** Compute Reconstruction Time ********************
-        torch.cuda.synchronize()
-        start_time = time.time()
-        latent_points, image_feats, motion_emb, pos_emb = self.forward_latent_points(
+        (
+            latent_points,
+            image_feats,
+            motion_emb,
+            pos_emb,
+            pred_shape,
+            _pred_shape_list,
+        ) = self.forward_latent_points(
             image,
             camera=None,
             query_points=query_points,
             ref_imgs_bool=kwargs.get("ref_imgs_bool", None),
         )  # [B, N, C]
 
+        use_pred_render = kwargs.get(
+            "use_pred_shape_for_render", self.use_pred_shape_for_render
+        )
+        smplx_for_gs = (
+            self.smplx_params_with_pred_shape_betas(smplx_params, pred_shape)
+            if use_pred_render and pred_shape is not None
+            else smplx_params
+        )
+
         self.renderer.hyper_step(10000000)  # set to max step
         gs_model_list, query_points, smplx_params = self.renderer.forward_gs(
             gs_hidden_features=latent_points,
             query_points=query_points,
-            smplx_data=smplx_params,
+            smplx_data=smplx_for_gs,
             additional_features={"image_feats": image_feats, "image": image[:, 0]},
         )
-        torch.cuda.synchronize()
-        time_calculator.add_time(time.time() - start_time)
-        print(time_calculator.average_time())
 
-        # ********************** Compute Reconstruction Time ********************
-        return (
+        _ret = (
             gs_model_list,
             query_points,
             smplx_params["transform_mat_neutral_pose"],
@@ -1041,6 +1163,9 @@ class ModelHumanA4OLRM(nn.Module):
             motion_emb,
             pos_emb,
         )
+        if return_pred_shape:
+            return _ret + (pred_shape,)
+        return _ret
 
     @torch.no_grad()
     def animation_infer(

@@ -11,10 +11,6 @@ from typing import Any, Dict
 sys.path.append("./")
 import torch
 import torch.nn as nn
-from diffusers.utils import is_torch_version
-from einops import rearrange, repeat
-from einops.layers.torch import Rearrange
-
 from core.models.heads.dpt_head import DPTHead
 from core.models.transformer_block.transformer_dit import (
     SD3MMJointRopeTransformerBlock,
@@ -22,6 +18,9 @@ from core.models.transformer_block.transformer_dit import (
 )
 from core.models.vggt_transformer import PositionGetter
 from core.structures.slidewindows import SlidingAverageTimer
+from diffusers.utils import is_torch_version
+from einops import rearrange, repeat
+from einops.layers.torch import Rearrange
 
 
 def init_weights(module, std=0.02):

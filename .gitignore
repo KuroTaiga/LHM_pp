@@ -79,3 +79,4 @@ lib/pointops/dist/
 # Ignore additional third-party libs
 lib/diff-gaussian-rasterization/
 lib/simple-knn/
+release_tools/
