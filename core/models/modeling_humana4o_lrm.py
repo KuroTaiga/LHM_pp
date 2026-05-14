@@ -1167,6 +1167,56 @@ class ModelHumanA4OLRM(nn.Module):
             return _ret + (pred_shape,)
         return _ret
 
+    def _animation_gs_rgb_mask_uint8(
+        self,
+        render_results,
+        target_h: int,
+        target_w: int,
+    ):
+        """GS-only path: interpolate rasterized RGB/mask to full render resolution.
+
+        ``forward_animate_gs`` is invoked per target view with a single-view camera
+        slice, so batched keys like ``comp_rgb`` have shape ``[B, 1, C, H, W]``;
+        the view slot to read is always index ``0``, not the outer loop index.
+        """
+        if "comp_rgb" not in render_results:
+            raise KeyError(
+                "gs_render mode requires renderer output key 'comp_rgb' (Gaussian rasterization)."
+            )
+        # Single-view pass per outer iteration → only one entry in the view dimension.
+        rgb_bchw = render_results["comp_rgb"][:, 0, ...].clamp(0, 1)
+        rgb_bchw = F.interpolate(
+            rgb_bchw,
+            size=(int(target_h), int(target_w)),
+            mode="bilinear",
+            align_corners=False,
+        )
+        predict_rgb = (
+            rgb_bchw[0].permute(1, 2, 0).detach().cpu().numpy() * 255
+        ).astype(np.uint8)
+
+        predict_mask = None
+        if "comp_mask" in render_results:
+            m = render_results["comp_mask"][:, 0, ...].float()
+            if m.dim() == 3:
+                m = m.unsqueeze(1)
+            if m.dim() != 4:
+                raise ValueError(
+                    f"Expected comp_mask slice [B,C,H,W] or [B,H,W]; got shape {tuple(m.shape)}"
+                )
+            m = F.interpolate(
+                m,
+                size=(int(target_h), int(target_w)),
+                mode="nearest",
+            )
+            predict_mask = (m[0, 0].detach().cpu().numpy() * 255).astype(np.uint8)
+        else:
+            predict_mask = np.full(
+                (int(target_h), int(target_w)), 255, dtype=np.uint8
+            )
+
+        return predict_rgb, predict_mask
+
     @torch.no_grad()
     def animation_infer(
         self,
@@ -1184,6 +1234,7 @@ class ModelHumanA4OLRM(nn.Module):
         offset_list=None,
         mask_seqs=None,
         output_rgb=None,
+        infer_output_renderer: str = "neural",
     ):
         """
         Perform animation inference for Gaussian Splatting-based human rendering.
@@ -1203,6 +1254,9 @@ class ModelHumanA4OLRM(nn.Module):
             offset_list (optional): List of offsets for animation, if any. Defaults to None.
             mask_seqs (optional): List or tensor of foreground masks for each view. Defaults to None.
             output_rgb (optional): If provided, stores the output RGBs. Defaults to None.
+            infer_output_renderer (str): ``"neural"`` applies the neural refinement decoder after
+                GS rasterization; ``"gs"`` uses Gaussian splat rasterization RGB (and mask if
+                available) only.
 
         Returns:
             Output(s) from DPT or renderer depending on configuration, e.g.:
@@ -1214,6 +1268,10 @@ class ModelHumanA4OLRM(nn.Module):
             This function supports multi-view animation inference and optionally uses
             masks and DPT decoding, depending on the model configuration.
         """
+        if infer_output_renderer not in ("neural", "gs"):
+            raise ValueError(
+                f'infer_output_renderer must be "neural" or "gs", got {infer_output_renderer!r}'
+            )
 
         render_h, render_w = int(render_intrs[0, 0, 1, 2] * 2), int(
             render_intrs[0, 0, 0, 2] * 2
@@ -1247,52 +1305,77 @@ class ModelHumanA4OLRM(nn.Module):
                     features=gs_hidden_features,
                 )
 
-                if self.neural_renderer_input == "feats":
-                    # backup to ori space.
-                    predict_rgbs, predict_masks = self.neural_renderer(
-                        image_latents,
-                        render_results["comp_features"],
-                        motion_emb,
-                        int(_render_h),
-                        int(_render_w),
-                        pos_emb_list=pos_emb,
+                if infer_output_renderer == "neural":
+                    if self.neural_renderer is None:
+                        raise RuntimeError(
+                            "neural_render selected but model has no neural_renderer."
+                        )
+                    if self.neural_renderer_input == "feats":
+                        # backup to ori space.
+                        predict_rgbs, predict_masks = self.neural_renderer(
+                            image_latents,
+                            render_results["comp_features"],
+                            motion_emb,
+                            int(_render_h),
+                            int(_render_w),
+                            pos_emb_list=pos_emb,
+                        )
+                    elif self.neural_renderer_input == "rgb+feats":
+                        renderer_inputs = torch.cat(
+                            [
+                                render_results["comp_features"],
+                                render_results["comp_rgb"],
+                            ],
+                            dim=2,
+                        )
+                        predict_rgbs, predict_masks = self.neural_renderer(
+                            image_latents,
+                            renderer_inputs,
+                            motion_emb,
+                            _render_h,
+                            _render_w,
+                            pos_emb_list=pos_emb,
+                        )
+                    else:
+                        raise NotImplementedError
+
+                    # predict_rgbs = predict_rgbs * predict_masks + (1-predict_masks)
+
+                    scale_x, scale_y, offset_x, offset_y = offset_list[view_idx]
+                    predict_rgb = (
+                        predict_rgbs[0, 0].detach().cpu().numpy() * 255
+                    ).astype(np.uint8)
+                    predict_rgb = cv2.resize(
+                        predict_rgb,
+                        (int(_render_w / scale_x), int(_render_h / scale_y)),
+                        interpolation=cv2.INTER_AREA,
                     )
-                elif self.neural_renderer_input == "rgb+feats":
-                    renderer_inputs = torch.cat(
-                        [render_results["comp_features"], render_results["comp_rgb"]],
-                        dim=2,
-                    )
-                    predict_rgbs, predict_masks = self.neural_renderer(
-                        image_latents,
-                        renderer_inputs,
-                        motion_emb,
-                        _render_h,
-                        _render_w,
-                        pos_emb_list=pos_emb,
+
+                    predict_mask = (
+                        predict_masks[0, 0].detach().cpu().numpy() * 255
+                    ).astype(np.uint8)[..., 0]
+                    predict_mask = cv2.resize(
+                        predict_mask,
+                        (int(_render_w / scale_x), int(_render_h / scale_y)),
+                        interpolation=cv2.INTER_NEAREST,
                     )
                 else:
-                    raise NotImplementedError
-
-                # predict_rgbs = predict_rgbs * predict_masks + (1-predict_masks)
-
-                scale_x, scale_y, offset_x, offset_y = offset_list[view_idx]
-                predict_rgb = (predict_rgbs[0, 0].detach().cpu().numpy() * 255).astype(
-                    np.uint8
-                )
-                predict_rgb = cv2.resize(
-                    predict_rgb,
-                    (int(_render_w / scale_x), int(_render_h / scale_y)),
-                    interpolation=cv2.INTER_AREA,
-                )
-
-                predict_mask = (
-                    predict_masks[0, 0].detach().cpu().numpy() * 255
-                ).astype(np.uint8)[..., 0]
-                predict_mask = cv2.resize(
-                    predict_mask,
-                    (int(_render_w / scale_x), int(_render_h / scale_y)),
-                    interpolation=cv2.INTER_NEAREST,
-                )
+                    scale_x, scale_y, offset_x, offset_y = offset_list[view_idx]
+                    predict_rgb, predict_mask = self._animation_gs_rgb_mask_uint8(
+                        render_results,
+                        _render_h,
+                        _render_w,
+                    )
+                    predict_rgb = cv2.resize(
+                        predict_rgb,
+                        (int(_render_w / scale_x), int(_render_h / scale_y)),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                    predict_mask = cv2.resize(
+                        predict_mask,
+                        (int(_render_w / scale_x), int(_render_h / scale_y)),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
 
                 _h, _w = predict_rgb.shape[:2]
                 boards = (output_rgb.clone().detach().cpu().numpy() * 255).astype(
@@ -1328,38 +1411,52 @@ class ModelHumanA4OLRM(nn.Module):
                     features=gs_hidden_features,
                 )
 
-                if self.neural_renderer_input == "feats":
-                    # backup to ori space.
-                    predict_rgbs, predict_masks = self.neural_renderer(
-                        image_latents,
-                        render_results["comp_features"],
-                        motion_emb,
-                        int(_render_h),
-                        int(_render_w),
-                        pos_emb_list=pos_emb,
-                    )
-                elif self.neural_renderer_input == "rgb+feats":
-                    renderer_inputs = torch.cat(
-                        [render_results["comp_features"], render_results["comp_rgb"]],
-                        dim=2,
-                    )
-                    predict_rgbs, predict_masks = self.neural_renderer(
-                        image_latents,
-                        renderer_inputs,
-                        motion_emb,
+                if infer_output_renderer == "neural":
+                    if self.neural_renderer is None:
+                        raise RuntimeError(
+                            "neural_render selected but model has no neural_renderer."
+                        )
+                    if self.neural_renderer_input == "feats":
+                        # backup to ori space.
+                        predict_rgbs, predict_masks = self.neural_renderer(
+                            image_latents,
+                            render_results["comp_features"],
+                            motion_emb,
+                            int(_render_h),
+                            int(_render_w),
+                            pos_emb_list=pos_emb,
+                        )
+                    elif self.neural_renderer_input == "rgb+feats":
+                        renderer_inputs = torch.cat(
+                            [
+                                render_results["comp_features"],
+                                render_results["comp_rgb"],
+                            ],
+                            dim=2,
+                        )
+                        predict_rgbs, predict_masks = self.neural_renderer(
+                            image_latents,
+                            renderer_inputs,
+                            motion_emb,
+                            _render_h,
+                            _render_w,
+                            pos_emb_list=pos_emb,
+                        )
+                    else:
+                        raise NotImplementedError
+
+                    predict_rgb = (
+                        predict_rgbs[0, 0].detach().cpu().numpy() * 255
+                    ).astype(np.uint8)
+                    predict_mask = (
+                        predict_masks[0, 0].detach().cpu().numpy() * 255
+                    ).astype(np.uint8)[..., 0]
+                else:
+                    predict_rgb, predict_mask = self._animation_gs_rgb_mask_uint8(
+                        render_results,
                         _render_h,
                         _render_w,
-                        pos_emb_list=pos_emb,
                     )
-                else:
-                    raise NotImplementedError
-
-                predict_rgb = (predict_rgbs[0, 0].detach().cpu().numpy() * 255).astype(
-                    np.uint8
-                )
-                predict_mask = (
-                    predict_masks[0, 0].detach().cpu().numpy() * 255
-                ).astype(np.uint8)[..., 0]
 
                 output.append(
                     torch.from_numpy(predict_rgb / 255.0).float().unsqueeze(0)

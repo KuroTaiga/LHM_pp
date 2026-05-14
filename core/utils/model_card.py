@@ -36,3 +36,13 @@ MEMORY_MODEL_CARD = {
     # "LHMPP-700MC": 8000,  # 8G, coming soon
     "LHMPPS-700M": 8000,  # 8G
 }
+
+# App / inference: gs_render (Gaussian raster only, no neural refiner) and
+# scripts/inference/to_gs_ply.py (GS PLY export, T-pose or SMPL-X frame) — add model keys here when validated.
+GS_RENDER_SUPPORTED_MODEL_NAMES = [
+    "LHMPP-700M-SMPLX-FREE",
+]
+
+
+def model_supports_gs_render(model_name: str) -> bool:
+    return model_name in GS_RENDER_SUPPORTED_MODEL_NAMES

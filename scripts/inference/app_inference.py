@@ -105,6 +105,7 @@ def inference_results(
     visualized_center: bool = False,
     batch_size: int = DEFAULT_BATCH_SIZE,
     device: str = "cuda",
+    infer_output_renderer: str = "neural",
 ) -> np.ndarray:
     """Run inference on a motion sequence with batching to prevent OOM.
 
@@ -118,6 +119,8 @@ def inference_results(
         visualized_center: If True, crops output to subject bounds with 10% padding.
         batch_size: Number of frames to process in each batch.
         device: Device to run inference on.
+        infer_output_renderer: ``"neural"`` applies the refinement decoder after GS
+            rasterization; ``"gs"`` outputs rasterized Gaussian splat RGB only.
 
     Returns:
         Rendered RGB frames as numpy array of shape (T, H, W, 3).
@@ -254,6 +257,7 @@ def inference_results(
             anim_kwargs["mask_seqs"] = mask_seqs
         if output_rgb is not None:
             anim_kwargs["output_rgb"] = output_rgb
+        anim_kwargs["infer_output_renderer"] = infer_output_renderer
 
         batch_rgb, batch_mask = model.animation_infer(**anim_kwargs)
         batch_rgb_list.append((batch_rgb.clamp(0, 1) * 255).to(torch.uint8).numpy())

@@ -66,6 +66,7 @@ train_data/
 pretrained_models/
 benchmark/
 motion_video/
+outputs/
 
 debug_vis/
 pretrained_models

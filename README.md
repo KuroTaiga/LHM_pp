@@ -45,6 +45,11 @@ If you prefer Chinese documentation, please see the [Chinese README](./README_CN
 
 - **LHMPP-700M (updated release):** We released a new LHMPP-700M build that supports **standard 3D Gaussian Splatting PLY (`3GS-PLY`)** as an output format.
 
+### New features
+
+- **Export `gs.ply`:** Run [`scripts/inference/to_gs_ply.py`](./scripts/inference/to_gs_ply.py) to save **3D Gaussian Splatting** as a standard **`.ply`**—either **canonical T-pose** (leave `--pose_dir` empty) or **a single SMPL-X JSON frame** (`--pose_dir`). Only **`LHMPP-700M-SMPLX-FREE`** is supported (see [`GS_RENDER_SUPPORTED_MODEL_NAMES`](./core/utils/model_card.py)). Full usage is in **Export Gaussian Splatting PLY (`to_gs_ply.py`)** under **Getting Started** below.
+- **GS render results:** In [`app.py`](./app.py), use **`gs_render`** for **RGB output from Gaussian splatting only** (no neural refinement). Launch with **`--gs`** when the model is **`LHMPP-700M-SMPLX-FREE`**, or switch **Output Renderer** to **gs_render** in the UI. See **Local Gradio Run** below.
+
 ### TODO List
 
 - [x] Core Inference Pipeline🔥🔥🔥
@@ -244,6 +249,77 @@ python ./scripts/test/test_app_case.py
 # Run LHM++ with Gradio API
 python ./app.py --model_name [LHMPP-700M, LHMPPS-700M], default LHMPP-700M
 ```
+
+**Render output mode (`app.py` only):** You can pick the startup default for the Gradio **Output Renderer** with mutually exclusive flags:
+
+| Flag | Meaning |
+|------|--------|
+| *(none)* | Start with **neural_render** (Gaussian splat rasterization + neural refinement decoder). |
+| `--neural` | Same as above; explicitly request **neural_render** on launch. |
+| `--gs` | Start with **gs_render** (Gaussian splat RGB only, no neural refiner). **Supported only for `LHMPP-700M-SMPLX-FREE`.** For any other `--model_name`, the app logs a warning and forces **neural_render**. |
+
+Examples:
+
+```bash
+# Default pipeline (neural_render)
+python ./app.py --model_name LHMPP-700M-SMPLX-FREE
+
+# Explicit neural_render
+python ./app.py --model_name LHMPP-700M-SMPLX-FREE --neural
+
+# Prefer gs_render at startup (SMPLX-FREE only)
+python ./app.py --model_name LHMPP-700M-SMPLX-FREE --gs
+```
+
+You can still change **Output Renderer** in the Gradio UI when **gs_render** is available for the loaded model (`LHMPP-700M-SMPLX-FREE` only).
+
+### Export Gaussian Splatting PLY (`to_gs_ply.py`)
+
+Export a **Gaussian Splatting** point cloud as a standard **PLY** for offline viewers or downstream tooling. Only checkpoints listed in **`GS_RENDER_SUPPORTED_MODEL_NAMES`** in [`core/utils/model_card.py`](./core/utils/model_card.py) have the required GS heads (currently **`LHMPP-700M-SMPLX-FREE`**). The script exits with an error if you pick any other `--model_name`.
+
+Run from the repo root (`LHM-plusplus`), after [environment setup](#environment-setup) and downloading **prior models + weights**.
+
+| Mode | Trigger | What you get |
+|------|---------|--------------|
+| **T-pose (canonical)** | Omit **`--pose_dir`** (empty / default) | Gaussians in **canonical T-pose** SMPL-X space, with a **synthetic** single-frame camera when no motion file is provided. |
+| **Any-pose (given SMPL-X frame)** | Set **`--pose_dir`** to **one** SMPL-X JSON | Gaussians **warped to that frame’s body pose** (and that JSON’s camera intrinsics are used in the forward pass). Not the full video / mask pipeline—only that file is read. |
+
+**Pipeline (current implementation):** Both modes run `infer_single_view` on your reference images. **T-pose** then builds canonical SMPL-X angles and calls **`model.inference_gs`** → `save_ply`. **Any-pose** builds SMPL-X from the JSON and saves the **first posed view** from **`model.renderer.animate_gs_model`** (same Gaussian warp as **`forward_animate_gs`** in the renderer). If that path returns no posed models, the script **falls back** to **`model.inference_gs`**.
+
+#### 1) T-pose (canonical GS, no pose JSON)
+
+Leave **`--pose_dir` empty** (default). The script uses a synthetic single-frame camera and exports **canonical T-pose** Gaussians via **`inference_gs`**, as described above.
+
+**Default output:** `<repo>/outputs/tpose_output/{ref_images_parent}.ply`  
+(e.g. with `./assets/example_multi_images/*.png` → `.../tpose_output/example_multi_images.ply`)
+
+```bash
+cd LHM-plusplus
+
+python scripts/inference/to_gs_ply.py \
+  --model_name LHMPP-700M-SMPLX-FREE \
+  --image_glob "./assets/example_multi_images/00000_yuliang_*.png"
+```
+
+#### 2) Any-pose (one SMPL-X JSON file)
+
+Pass **`--pose_dir`** to a **single** SMPL-X parameter JSON (e.g. `motion_video/BasketBall_I/smplx_params/00014.json`). The script reads **only that file** for camera intrinsics + body pose (no video pipeline, no segmentation masks). The exported PLY is the **posed** Gaussian cloud from **`animate_gs_model`** (not the internal canonical-template-only branch). Optional FLAME sidecar: `../flame_params/<same_basename>.json`.
+
+**Default output:** `<repo>/outputs/animation_output/{sequence_name}/{ref_images_parent}_{json_stem}.ply`  
+(e.g. `.../animation_output/BasketBall_I/example_multi_images_00014.ply`)
+
+```bash
+cd LHM-plusplus
+
+python scripts/inference/to_gs_ply.py \
+  --model_name LHMPP-700M-SMPLX-FREE \
+  --pose_dir "./motion_video/BasketBall_I/smplx_params/00014.json" \
+  --image_glob "./assets/example_multi_images/00000_yuliang_*.png"
+```
+
+**Optional:** `--output /path/to/out.ply` overrides the defaults above; `--model_path /path/to/LHMPP-700M-SMPLX-FREE` uses local weights while keeping `--model_name` for the YAML config.
+
+Useful flags: `--images_dir`, `--ref_view`, `--device`, `--work_dir`. Shape-from-image **betas** follow the app when `use_smplx_shape_estimator` is enabled in config (same as Gradio).
 
 **Running Tips:** Ensure the input images are high resolution, preferably with visible hand details, and include at least one image where the body is fully extended/spread out.
 

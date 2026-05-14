@@ -7,6 +7,7 @@
 
 import argparse
 import glob
+import logging
 import os
 import shutil
 import warnings
@@ -42,7 +43,11 @@ from core.utils.app_utils import (
     prepare_input_and_output,
     split_image,
 )
-from core.utils.model_card import MODEL_CONFIG
+from core.utils.model_card import (
+    GS_RENDER_SUPPORTED_MODEL_NAMES,
+    MODEL_CONFIG,
+    model_supports_gs_render,
+)
 from core.utils.model_download_utils import AutoModelQuery
 from engine.pose_estimation.pose_estimator import PoseEstimator
 from scripts.download_motion_video import motion_video_check
@@ -58,6 +63,8 @@ from scripts.inference.utils import (
     prepare_working_dir,
 )
 
+logger = logging.getLogger(__name__)
+
 # ==================== Configuration Constants ====================
 MOTION_SIZE: int = 120
 MV_IMAGES_THRESHOLD: int = 8
@@ -67,6 +74,33 @@ DEFAULT_VIDEO_CODEC: str = "libx264"
 DEFAULT_PIXEL_FORMAT: str = "yuv420p"
 DEFAULT_VIDEO_BITRATE: str = "10M"
 MACRO_BLOCK_SIZE: int = 16
+
+APP_RENDER_BACKEND_MAP = {
+    "neural_render": "neural",
+    "gs_render": "gs",
+}
+
+
+def resolve_cli_render_backend(
+    args: argparse.Namespace, model_name: str
+) -> Tuple[str, bool]:
+    """Resolve initial Gradio render mode from ``--neural`` / ``--gs`` and model capability.
+
+    Returns:
+        (initial_radio_value, gs_render_supported_for_this_model).
+    """
+    gs_ok = model_supports_gs_render(model_name)
+    if getattr(args, "gs", False):
+        if gs_ok:
+            return "gs_render", True
+        logger.warning(
+            "当前模型 %r 不支持 gs_render；当前白名单为：%s；已强制使用 neural_render。",
+            model_name,
+            ", ".join(GS_RENDER_SUPPORTED_MODEL_NAMES),
+        )
+        return "neural_render", gs_ok
+    return "neural_render", gs_ok
+
 
 def get_motion_video_fps(
     video_params: Union[str, Dict[str, Any]], default: int = DEFAULT_FPS
@@ -108,8 +142,18 @@ def demo_lhmpp(
     pose_estimator: Optional[PoseEstimator],
     dataset_pipeline: SrcImagePipeline,
     cfg: DictConfig,
+    initial_render_backend: str = "neural_render",
+    gs_render_available: bool = True,
 ) -> None:
     """Initialize and launch the Gradio demo interface."""
+
+    render_backend_choices: List[str] = (
+        ["neural_render", "gs_render"]
+        if gs_render_available
+        else ["neural_render"]
+    )
+    if initial_render_backend not in render_backend_choices:
+        initial_render_backend = "neural_render"
 
     @spaces.GPU(duration=200)
     def core_fn(
@@ -121,6 +165,7 @@ def demo_lhmpp(
         working_dir: Any,
         motion_size: int,
         render_fps: int,
+        render_backend: str,
     ) -> Tuple[Any, Optional[str], None, List[Image.Image]]:
         """Core inference function for the Gradio interface."""
         import gradio as gr
@@ -164,6 +209,13 @@ def demo_lhmpp(
         else:
             smplx_params = smplx_params.copy()
 
+        backend_choice = render_backend
+        if backend_choice == "gs_render" and not gs_render_available:
+            logger.warning(
+                "当前模型不支持 gs_render，已改用 neural_render。"
+            )
+            backend_choice = "neural_render"
+
         rgbs = inference_results(
             lhmpp,
             ref_imgs_tensor,
@@ -172,6 +224,7 @@ def demo_lhmpp(
             video_size=video_size,
             visualized_center=visualized_center,
             device=device,
+            infer_output_renderer=APP_RENDER_BACKEND_MAP[backend_choice],
         )
 
         render_fps_actual = get_motion_video_fps(video_params, default=render_fps)
@@ -300,6 +353,13 @@ def demo_lhmpp(
                         )
                         center_visualizen = gr.Checkbox(
                             label="Center Crop", value=False, scale=1
+                        )
+                        render_backend = gr.Radio(
+                            label="Output Renderer",
+                            choices=render_backend_choices,
+                            value=initial_render_backend,
+                            elem_id="render_backend",
+                            scale=2,
                         )
 
                 with gr.Tabs(elem_id="core_input_image"):
@@ -431,6 +491,7 @@ def demo_lhmpp(
                 working_dir,
                 motion_size,
                 render_fps,
+                render_backend,
             ],
             outputs=[
                 multiimage_prompt,
@@ -484,6 +545,17 @@ def get_parse() -> argparse.Namespace:
         help="Model name",
     )
     parser.add_argument("--debug", action="store_true", help="Debug mode")
+    render_mode = parser.add_mutually_exclusive_group()
+    render_mode.add_argument(
+        "--neural",
+        action="store_true",
+        help="Use neural_render (default if neither flag is set)",
+    )
+    render_mode.add_argument(
+        "--gs",
+        action="store_true",
+        help="Prefer gs_render at startup (only LHMPP-700M-SMPLX-FREE; others fall back to neural_render)",
+    )
     return parser.parse_args()
 
 
@@ -491,6 +563,10 @@ def launch_gradio_app() -> None:
     """Launch the Gradio application."""
     args = get_parse()
     model_name = args.model_name
+
+    initial_render_backend, gs_render_available = resolve_cli_render_backend(
+        args, model_name
+    )
 
     prior_model_check(save_dir="./pretrained_models")
     motion_video_check(save_dir=".")
@@ -543,7 +619,14 @@ def launch_gradio_app() -> None:
         else:
             pose_estimator = None
 
-    demo_lhmpp(lhmpp, pose_estimator, dataset_pipeline, cfg)
+    demo_lhmpp(
+        lhmpp,
+        pose_estimator,
+        dataset_pipeline,
+        cfg,
+        initial_render_backend=initial_render_backend,
+        gs_render_available=gs_render_available,
+    )
 
 
 if __name__ == "__main__":
