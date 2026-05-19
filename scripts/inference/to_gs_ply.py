@@ -32,6 +32,7 @@ import importlib.util
 import json
 import math
 import os
+import re
 import sys
 from pathlib import Path
 from contextlib import contextmanager
@@ -74,6 +75,23 @@ from core.utils.model_card import (
     model_supports_gs_render,
 )
 from core.utils.model_download_utils import AutoModelQuery
+from core.utils.video import images_to_video
+
+
+FRAME_VARYING_SMPLX_KEYS = (
+    "root_pose",
+    "body_pose",
+    "jaw_pose",
+    "leye_pose",
+    "reye_pose",
+    "lhand_pose",
+    "rhand_pose",
+    "trans",
+    "focal",
+    "princpt",
+    "img_size_wh",
+    "expr",
+)
 
 
 def _require_gs_output_model(model_name: str) -> None:
@@ -115,9 +133,34 @@ def _effective_pose_dir(args: argparse.Namespace) -> str | None:
     return s if s else None
 
 
+def _resolved_pose_input(args: argparse.Namespace) -> str | None:
+    pose_path = _effective_pose_dir(args)
+    if pose_path is None:
+        return None
+    return str(Path(pose_path).expanduser().resolve())
+
+
+def _pose_input_mode(args: argparse.Namespace) -> str:
+    """Return ``tpose``, ``single_pose``, or ``pose_sequence``."""
+    pose_path = _resolved_pose_input(args)
+    if pose_path is None:
+        return "tpose"
+    if os.path.isdir(pose_path):
+        return "pose_sequence"
+    if os.path.isfile(pose_path):
+        return "single_pose"
+    raise FileNotFoundError(
+        f"--pose_dir must be empty, a SMPL-X JSON file, or a directory of JSONs. Got: {pose_path}"
+    )
+
+
 def _derive_pose_seq_folder_name(pose_json_path: str) -> str:
-    """``.../BasketBall_I/smplx_params/00014.json`` -> ``BasketBall_I``."""
+    """Derive a stable motion sequence folder name from a JSON or JSON directory path."""
     p = Path(pose_json_path).resolve()
+    if p.is_dir():
+        if p.name == "smplx_params":
+            return _sanitize_export_folder_name(p.parent.name)
+        return _sanitize_export_folder_name(p.name)
     if p.parent.name == "smplx_params":
         return _sanitize_export_folder_name(p.parent.parent.name)
     return _sanitize_export_folder_name(p.parent.name)
@@ -157,14 +200,31 @@ def _derive_folder_name_for_tpose_output(args: argparse.Namespace) -> str:
 
 
 def default_export_output_path(args: argparse.Namespace) -> str:
-    """T-pose: ``outputs/tpose_output/{ref}.ply``; posed: ``outputs/animation_output/{seq}/{ref}_{frame}.ply``."""
-    pose_path = _effective_pose_dir(args)
-    if pose_path is None:
+    """Default output target for the active mode.
+
+    T-pose:
+        ``outputs/tpose_output/{ref}.ply``
+    Single posed frame:
+        ``outputs/animation_output/{seq}/{ref}_{frame}.ply``
+    Pose sequence folder:
+        ``outputs/animation_output/{seq}/{ref}/``
+    """
+    mode = _pose_input_mode(args)
+    if mode == "tpose":
         folder = _derive_folder_name_for_tpose_output(args)
         return os.path.join(_LHM_ROOT, "outputs", "tpose_output", f"{folder}.ply")
-    pose_path = str(Path(pose_path).expanduser())
+    pose_path = _resolved_pose_input(args)
+    assert pose_path is not None
     motion_key = _derive_pose_seq_folder_name(pose_path)
     img_key = _derive_input_image_folder_name(args)
+    if mode == "pose_sequence":
+        return os.path.join(
+            _LHM_ROOT,
+            "outputs",
+            "animation_output",
+            motion_key,
+            img_key,
+        )
     frame_stem = _sanitize_export_folder_name(Path(pose_path).stem)
     fname = f"{img_key}_{frame_stem}.ply"
     return os.path.join(
@@ -213,7 +273,10 @@ def _easy_memory_manager(model: torch.nn.Module, device: str = "cuda"):
 def build_arg_parser() -> argparse.ArgumentParser:
     gs_names = _gs_model_name_choices()
     parser = argparse.ArgumentParser(
-        description="Load LHM++ and export Gaussian Splatting as PLY (T-pose or SMPL-X frame; same path as app / test_app_case)."
+        description=(
+            "Load LHM++ and export Gaussian Splatting as either canonical PLY, a single "
+            "posed-frame PLY, or a pose-sequence package (cano_gs.ply + frame_*.ply + MP4)."
+        )
     )
     parser.add_argument(
         "--model_name",
@@ -248,9 +311,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default="",
         help=(
-            "Path to one SMPL-X parameter JSON (e.g. motion_video/BasketBall_I/smplx_params/00014.json). "
-            "Optional matching FLAME file: ../flame_params/<same_name>.json. "
-            "Default empty => canonical T-pose export with a synthetic camera (no motion file)."
+            "Path to either one SMPL-X parameter JSON (single posed-frame mode) or a directory "
+            "containing per-frame SMPL-X JSONs (sequence mode). Optional matching FLAME sidecars "
+            "are loaded from ../flame_params/<same_name>.json when present. Default empty => "
+            "canonical T-pose export with a synthetic camera (no motion file)."
         ),
     )
     parser.add_argument(
@@ -264,9 +328,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help=(
-            "Target PLY path. Default when ``--pose_dir`` is empty: "
+            "Target output path. In T-pose or single-JSON mode this is a PLY path. In JSON-folder "
+            "sequence mode this is an output directory. Default when ``--pose_dir`` is empty: "
             "<repo>/outputs/tpose_output/{ref_images_parent}.ply; "
-            "with a pose JSON: <repo>/outputs/animation_output/{seq}/{ref_images_parent}_{json_stem}.ply"
+            "with one pose JSON: <repo>/outputs/animation_output/{seq}/{ref_images_parent}_{json_stem}.ply; "
+            "with a pose directory: <repo>/outputs/animation_output/{seq}/{ref_images_parent}/"
         ),
     )
     parser.add_argument(
@@ -280,6 +346,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default="cuda",
         help="Device for model and tensors.",
+    )
+    parser.add_argument(
+        "--video_fps",
+        type=int,
+        default=30,
+        help="Sequence-mode preview video FPS.",
+    )
+    parser.add_argument(
+        "--video_renderer",
+        type=str,
+        default="gs",
+        choices=("gs", "neural"),
+        help=(
+            'Sequence-mode preview renderer. "gs" uses Gaussian splat RGB only; '
+            '"neural" uses the refinement decoder when available.'
+        ),
     )
     return parser
 
@@ -413,26 +495,7 @@ def _build_motion_seq_from_pose_json(json_path: str, cfg: Any) -> dict[str, Any]
             f"--pose_dir must point to a .json file (e.g. .../smplx_params/00014.json), got {path!r}"
         )
 
-    with open(path, "r", encoding="utf-8") as f:
-        raw: dict[str, Any] = json.load(f)
-
-    p = Path(path)
-    if p.parent.name == "smplx_params":
-        flame_path = p.parent.parent / "flame_params" / p.name
-    else:
-        flame_path = p.parent / "flame_params" / p.name
-    if flame_path.is_file():
-        with open(flame_path, "r", encoding="utf-8") as f:
-            flame_params = json.load(f)
-        raw["expr"] = flame_params["expcode"]
-        pc = flame_params["posecode"]
-        raw["jaw_pose"] = pc[3:6] if len(pc) >= 6 else [0.0, 0.0, 0.0]
-        ec = flame_params["eyecode"]
-        raw["leye_pose"] = ec[:3] if len(ec) >= 3 else [0.0, 0.0, 0.0]
-        raw["reye_pose"] = ec[3:6] if len(ec) >= 6 else [0.0, 0.0, 0.0]
-
-    if "expr" not in raw:
-        raw["expr"] = [0.0] * 100
+    raw = _load_pose_json_with_flame(path)
 
     smplx_param = _parse_smplx_raw(raw)
     c2w, intr = _load_pose_minimal(smplx_param)
@@ -450,6 +513,125 @@ def _build_motion_seq_from_pose_json(json_path: str, cfg: Any) -> dict[str, Any]
     base["offset_list"] = [[1.0, 1.0, 0.0, 0.0]]
     base["ori_size"] = (tgt_h, tgt_w)
     base["motion_seqs"] = []
+    return base
+
+
+def _zero_hand_pose_template() -> list[list[float]]:
+    return [[0.0, 0.0, 0.0] for _ in range(15)]
+
+
+def _normalize_smplx_raw(raw: dict[str, Any]) -> dict[str, Any]:
+    rename_map = {
+        "global_orient": "root_pose",
+        "transl": "trans",
+        "left_hand_pose": "lhand_pose",
+        "right_hand_pose": "rhand_pose",
+    }
+    for old_key, new_key in rename_map.items():
+        if old_key in raw and new_key not in raw:
+            raw[new_key] = raw.pop(old_key)
+
+    raw.pop("meta", None)
+    raw.setdefault("root_pose", [0.0, 0.0, 0.0])
+    raw.setdefault("trans", [0.0, 0.0, 0.0])
+    raw.setdefault("jaw_pose", [0.0, 0.0, 0.0])
+    raw.setdefault("leye_pose", [0.0, 0.0, 0.0])
+    raw.setdefault("reye_pose", [0.0, 0.0, 0.0])
+    raw.setdefault("lhand_pose", _zero_hand_pose_template())
+    raw.setdefault("rhand_pose", _zero_hand_pose_template())
+    raw.setdefault("expr", [0.0] * 100)
+    return raw
+
+
+def _load_pose_json_with_flame(json_path: str) -> dict[str, Any]:
+    path = Path(json_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Pose JSON not found: {path}")
+    if path.suffix.lower() != ".json":
+        raise ValueError(f"Pose input must be a .json file, got: {path}")
+
+    with open(path, "r", encoding="utf-8") as f:
+        raw: dict[str, Any] = json.load(f)
+    raw = _normalize_smplx_raw(raw)
+
+    if path.parent.name == "smplx_params":
+        flame_path = path.parent.parent / "flame_params" / path.name
+    else:
+        flame_path = path.parent / "flame_params" / path.name
+
+    if flame_path.is_file():
+        with open(flame_path, "r", encoding="utf-8") as f:
+            flame_params = json.load(f)
+        raw["expr"] = flame_params.get("expcode", raw["expr"])
+        posecode = flame_params.get("posecode", [])
+        eyecode = flame_params.get("eyecode", [])
+        raw["jaw_pose"] = posecode[3:6] if len(posecode) >= 6 else raw["jaw_pose"]
+        raw["leye_pose"] = eyecode[:3] if len(eyecode) >= 3 else raw["leye_pose"]
+        raw["reye_pose"] = eyecode[3:6] if len(eyecode) >= 6 else raw["reye_pose"]
+
+    return raw
+
+
+def _natural_sort_key(value: str) -> list[Any]:
+    return [
+        int(part) if part.isdigit() else part.lower()
+        for part in re.split(r"(\d+)", value)
+    ]
+
+
+def _sorted_pose_json_paths(pose_dir: str) -> list[str]:
+    root = Path(pose_dir).expanduser().resolve()
+    if not root.is_dir():
+        raise NotADirectoryError(f"Expected a pose JSON directory, got: {root}")
+    json_paths = [str(path.resolve()) for path in root.glob("*.json") if path.is_file()]
+    json_paths = sorted(json_paths, key=lambda path: _natural_sort_key(Path(path).stem))
+    if not json_paths:
+        raise FileNotFoundError(f"No pose JSONs found in directory: {root}")
+    return json_paths
+
+
+def _build_motion_seq_from_pose_dir(pose_dir: str, cfg: Any) -> dict[str, Any]:
+    """Multi-frame ``motion_seq`` dict from a directory of per-frame SMPL-X JSONs."""
+    json_paths = _sorted_pose_json_paths(pose_dir)
+    c2ws: list[torch.Tensor] = []
+    intrs: list[torch.Tensor] = []
+    smplx_params_list: list[dict[str, torch.Tensor]] = []
+    shape_param: torch.Tensor | None = None
+
+    for json_path in json_paths:
+        raw = _load_pose_json_with_flame(json_path)
+        smplx_param = _parse_smplx_raw(raw)
+        c2w, intr = _load_pose_minimal(smplx_param)
+        c2ws.append(c2w)
+        intrs.append(intr)
+        smplx_params_list.append(smplx_param)
+        if shape_param is None:
+            shape_param = smplx_param["betas"]
+
+    if shape_param is None:
+        raise RuntimeError(f"Failed to load any SMPL-X parameters from {pose_dir}")
+
+    stacked = _stack_smplx_params_list_minimal(smplx_params_list, shape_param)
+    render_c2ws = torch.stack(c2ws, dim=0)
+    render_intrs = torch.stack(intrs, dim=0)
+    bg_colors = torch.ones((len(json_paths), 3), dtype=torch.float32)
+    base = _to_motion_batch_dict_minimal(
+        render_c2ws,
+        render_intrs,
+        bg_colors,
+        stacked,
+        [],
+        vis_motion=False,
+    )
+
+    if "img_size_wh" in smplx_params_list[0]:
+        wh = smplx_params_list[0]["img_size_wh"]
+        tgt_w, tgt_h = int(wh[0].item()), int(wh[1].item())
+    else:
+        tgt_h, tgt_w = _synthetic_render_hw(cfg)
+
+    base["ori_size"] = (tgt_h, tgt_w)
+    base["motion_seqs"] = json_paths
     return base
 
 
@@ -566,6 +748,230 @@ def build_animation_frame_smplx_params(
     return sp
 
 
+def _run_infer_single_view(
+    model: torch.nn.Module,
+    ref_imgs_tensor: torch.Tensor,
+    motion_seq: dict[str, Any],
+    device: str,
+) -> SimpleNamespace:
+    """Run ``infer_single_view`` once and keep the reusable tensors for GS/video export."""
+    dev = torch.device(device)
+    smplx_dev = {k: v.to(dev) for k, v in motion_seq["smplx_params"].items()}
+    ref_batch = ref_imgs_tensor.unsqueeze(0)
+    ref_mask = torch.ones(
+        ref_imgs_tensor.shape[0], dtype=torch.bool, device=dev
+    ).unsqueeze(0)
+    use_pred_render = getattr(model, "use_pred_shape_for_render", False)
+
+    model_outputs = model.infer_single_view(
+        ref_batch,
+        None,
+        None,
+        render_c2ws=motion_seq["render_c2ws"].to(dev),
+        render_intrs=motion_seq["render_intrs"].to(dev),
+        render_bg_colors=motion_seq["render_bg_colors"].to(dev),
+        smplx_params=smplx_dev,
+        ref_imgs_bool=ref_mask,
+        return_pred_shape=use_pred_render,
+    )
+
+    pred_shape = None
+    if len(model_outputs) == 8:
+        (
+            gs_model_list,
+            query_points,
+            transform_mat_neutral_pose,
+            gs_hidden_features,
+            image_latents,
+            motion_emb,
+            pos_emb,
+            pred_shape,
+        ) = model_outputs
+    elif len(model_outputs) == 7:
+        (
+            gs_model_list,
+            query_points,
+            transform_mat_neutral_pose,
+            gs_hidden_features,
+            image_latents,
+            motion_emb,
+            pos_emb,
+        ) = model_outputs
+    elif len(model_outputs) == 6:
+        (
+            gs_model_list,
+            query_points,
+            transform_mat_neutral_pose,
+            gs_hidden_features,
+            image_latents,
+            motion_emb,
+        ) = model_outputs
+        pos_emb = None
+    else:
+        raise RuntimeError(f"Unexpected infer_single_view outputs: {len(model_outputs)}")
+
+    merged = type(model).smplx_params_with_pred_shape_betas(smplx_dev, pred_shape)
+    merged_betas = merged["betas"]
+    return SimpleNamespace(
+        device=dev,
+        smplx_dev=smplx_dev,
+        gs_model_list=gs_model_list,
+        query_points=query_points,
+        transform_mat_neutral_pose=transform_mat_neutral_pose,
+        gs_hidden_features=gs_hidden_features,
+        image_latents=image_latents,
+        motion_emb=motion_emb,
+        pos_emb=pos_emb,
+        pred_shape=pred_shape,
+        merged_betas=merged_betas,
+    )
+
+
+def _export_gaussian_model(
+    model: torch.nn.Module,
+    infer_ctx: SimpleNamespace,
+    motion_seq_one: dict[str, Any],
+    output_ply: str,
+    *,
+    export_animation_pose: bool,
+) -> None:
+    """Save one canonical or posed Gaussian PLY using cached ``infer_single_view`` outputs."""
+    dtype = infer_ctx.merged_betas.dtype
+    if export_animation_pose:
+        gs_smplx = build_animation_frame_smplx_params(
+            motion_seq_one,
+            infer_ctx.transform_mat_neutral_pose,
+            infer_ctx.merged_betas,
+            infer_ctx.device,
+            dtype,
+        )
+    else:
+        gs_smplx = build_tpose_smplx_params(
+            motion_seq_one,
+            infer_ctx.transform_mat_neutral_pose,
+            infer_ctx.merged_betas,
+            infer_ctx.device,
+            dtype,
+        )
+
+    render_c2ws = motion_seq_one["render_c2ws"].to(infer_ctx.device)
+    render_intrs = motion_seq_one["render_intrs"].to(infer_ctx.device)
+    render_bg_colors = motion_seq_one["render_bg_colors"].to(infer_ctx.device)
+    view_idx = 0
+    renderer = model.renderer
+
+    if export_animation_pose:
+        smplx_view = renderer.get_single_view_smpl_data(gs_smplx, view_idx)
+        smplx_one = renderer._get_single_batch_data(smplx_view, 0)
+        anim_models, _ = renderer.animate_gs_model(
+            infer_ctx.gs_model_list[0],
+            infer_ctx.query_points["neutral_coords"][0],
+            smplx_one,
+            debug=False,
+            mesh_meta=infer_ctx.query_points["mesh_meta"],
+        )
+        if anim_models:
+            gs_model = anim_models[0]
+        else:
+            gs_model = model.inference_gs(
+                infer_ctx.gs_model_list,
+                infer_ctx.query_points,
+                gs_smplx,
+                render_c2ws,
+                render_intrs,
+                render_bg_colors,
+                infer_ctx.gs_hidden_features,
+                pad_forward=False,
+            )
+    else:
+        gs_model = model.inference_gs(
+            infer_ctx.gs_model_list,
+            infer_ctx.query_points,
+            gs_smplx,
+            render_c2ws,
+            render_intrs,
+            render_bg_colors,
+            infer_ctx.gs_hidden_features,
+            pad_forward=False,
+        )
+
+    out_abs = os.path.abspath(output_ply)
+    out_dir = os.path.dirname(out_abs)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    gs_model.save_ply(out_abs)
+    if export_animation_pose:
+        print(f"Saved SMPL-X pose Gaussian PLY to {out_abs}")
+    else:
+        print(f"Saved T-pose canonical Gaussian PLY to {out_abs}")
+
+
+def _render_sequence_frames(
+    model: torch.nn.Module,
+    infer_ctx: SimpleNamespace,
+    motion_seq: dict[str, Any],
+    *,
+    infer_output_renderer: str,
+    batch_size: int = 40,
+) -> np.ndarray:
+    """Render RGB preview frames for a motion sequence using cached ``infer_single_view`` outputs."""
+    video_size = int(motion_seq["render_c2ws"].shape[1])
+    offset_list = motion_seq.get("offset_list")
+    ori_h, ori_w = motion_seq.get("ori_size", (512, 512))
+    output_rgb = torch.ones((ori_h, ori_w, 3))
+
+    batch_smplx_params: dict[str, torch.Tensor] = {
+        "betas": infer_ctx.merged_betas,
+        "transform_mat_neutral_pose": infer_ctx.transform_mat_neutral_pose,
+    }
+    batch_rgb_list: list[np.ndarray] = []
+    num_batches = (video_size + batch_size - 1) // batch_size
+
+    for batch_idx in range(0, video_size, batch_size):
+        current_batch = batch_idx // batch_size + 1
+        print(f"Rendering preview batch {current_batch}/{num_batches}")
+        batch_smplx_params.update(
+            {
+                key: motion_seq["smplx_params"][key][
+                    :, batch_idx : batch_idx + batch_size
+                ].to(infer_ctx.device)
+                for key in FRAME_VARYING_SMPLX_KEYS
+                if key in motion_seq["smplx_params"]
+            }
+        )
+
+        anim_kwargs: dict[str, Any] = {
+            "gs_model_list": infer_ctx.gs_model_list,
+            "query_points": infer_ctx.query_points,
+            "smplx_params": batch_smplx_params,
+            "render_c2ws": motion_seq["render_c2ws"][
+                :, batch_idx : batch_idx + batch_size
+            ].to(infer_ctx.device),
+            "render_intrs": motion_seq["render_intrs"][
+                :, batch_idx : batch_idx + batch_size
+            ].to(infer_ctx.device),
+            "render_bg_colors": motion_seq["render_bg_colors"][
+                :, batch_idx : batch_idx + batch_size
+            ].to(infer_ctx.device),
+            "gs_hidden_features": infer_ctx.gs_hidden_features,
+            "image_latents": infer_ctx.image_latents,
+            "motion_emb": infer_ctx.motion_emb,
+            "infer_output_renderer": infer_output_renderer,
+        }
+        if infer_ctx.pos_emb is not None:
+            anim_kwargs["pos_emb"] = infer_ctx.pos_emb
+        if offset_list is not None:
+            anim_kwargs["offset_list"] = offset_list[batch_idx : batch_idx + batch_size]
+            anim_kwargs["output_rgb"] = output_rgb
+
+        batch_rgb, _batch_mask = model.animation_infer(**anim_kwargs)
+        batch_rgb_list.append(
+            (batch_rgb.clamp(0, 1) * 255).to(torch.uint8).cpu().numpy()
+        )
+
+    return np.concatenate(batch_rgb_list, axis=0)
+
+
 @torch.no_grad()
 def run_tpose_export(
     model: torch.nn.Module,
@@ -584,126 +990,73 @@ def run_tpose_export(
     If ``export_animation_pose`` is True (non-empty ``--pose_dir``), the final GS matches that
     JSON pose. Otherwise it uses canonical T-pose in SMPL-X angles.
     """
-    dev = torch.device(device)
-    use_pred_render = getattr(model, "use_pred_shape_for_render", False)
     motion_one = slice_motion_seq_to_single_frame(motion_seq, frame_idx=0)
-
-    render_c2ws = motion_one["render_c2ws"].to(dev)
-    render_intrs = motion_one["render_intrs"].to(dev)
-    render_bg_colors = motion_one["render_bg_colors"].to(dev)
-    smplx_dev = {k: v.to(dev) for k, v in motion_one["smplx_params"].items()}
-
-    ref_batch = ref_imgs_tensor.unsqueeze(0)
-    ref_mask = torch.ones(
-        ref_imgs_tensor.shape[0], dtype=torch.bool, device=dev
-    ).unsqueeze(0)
-
-    model_outputs = model.infer_single_view(
-        ref_batch,
-        None,
-        None,
-        render_c2ws=render_c2ws,
-        render_intrs=render_intrs,
-        render_bg_colors=render_bg_colors,
-        smplx_params=smplx_dev,
-        ref_imgs_bool=ref_mask,
-        return_pred_shape=use_pred_render,
+    infer_ctx = _run_infer_single_view(model, ref_imgs_tensor, motion_one, device)
+    _export_gaussian_model(
+        model,
+        infer_ctx,
+        motion_one,
+        output_ply,
+        export_animation_pose=export_animation_pose,
     )
 
-    pred_shape = None
-    if len(model_outputs) == 8:
-        (
-            gs_model_list,
-            query_points,
-            transform_mat_neutral_pose,
-            gs_hidden_features,
-            _image_feats,
-            _motion_emb,
-            _pos_emb,
-            pred_shape,
-        ) = model_outputs
-    elif len(model_outputs) == 7:
-        (
-            gs_model_list,
-            query_points,
-            transform_mat_neutral_pose,
-            gs_hidden_features,
-            _image_feats,
-            _motion_emb,
-            _pos_emb,
-        ) = model_outputs
-    else:
-        raise RuntimeError(f"Unexpected infer_single_view outputs: {len(model_outputs)}")
 
-    merged = type(model).smplx_params_with_pred_shape_betas(smplx_dev, pred_shape)
-    merged_betas = merged["betas"]
+@torch.no_grad()
+def run_pose_sequence_export(
+    model: torch.nn.Module,
+    ref_imgs_tensor: torch.Tensor,
+    motion_seq: dict[str, Any],
+    device: str,
+    output_dir: str,
+    *,
+    video_fps: int,
+    video_renderer: str,
+) -> None:
+    """Export a canonical PLY, frame-wise posed PLYs, and a preview MP4 for a pose JSON folder."""
+    out_dir = os.path.abspath(output_dir)
+    os.makedirs(out_dir, exist_ok=True)
+    frame_count = int(motion_seq["render_c2ws"].shape[1])
+    infer_ctx = _run_infer_single_view(model, ref_imgs_tensor, motion_seq, device)
 
-    dtype = merged_betas.dtype
-    if export_animation_pose:
-        gs_smplx = build_animation_frame_smplx_params(
-            motion_one,
-            transform_mat_neutral_pose,
-            merged_betas,
-            dev,
-            dtype,
-        )
-    else:
-        gs_smplx = build_tpose_smplx_params(
-            motion_one,
-            transform_mat_neutral_pose,
-            merged_betas,
-            dev,
-            dtype,
+    cano_path = os.path.join(out_dir, "cano_gs.ply")
+    canonical_motion = slice_motion_seq_to_single_frame(motion_seq, frame_idx=0)
+    _export_gaussian_model(
+        model,
+        infer_ctx,
+        canonical_motion,
+        cano_path,
+        export_animation_pose=False,
+    )
+
+    for frame_idx in range(frame_count):
+        frame_motion = slice_motion_seq_to_single_frame(motion_seq, frame_idx=frame_idx)
+        frame_path = os.path.join(out_dir, f"frame_{frame_idx:05d}.ply")
+        _export_gaussian_model(
+            model,
+            infer_ctx,
+            frame_motion,
+            frame_path,
+            export_animation_pose=True,
         )
 
-    view_idx = 0
-    renderer = model.renderer
-    if export_animation_pose:
-        # ``model.inference_gs`` → ``inference_cano_gs`` only appends ``cano_models`` (last template row
-        # from ``_prepare_smplx_data``), which looks like T-pose. Use ``animate_gs_model`` like
-        # ``forward_animate_gs`` and take the first posed view (``anim_models[0]``).
-        smplx_view = renderer.get_single_view_smpl_data(gs_smplx, view_idx)
-        smplx_one = renderer._get_single_batch_data(smplx_view, 0)
-        anim_models, _ = renderer.animate_gs_model(
-            gs_model_list[0],
-            query_points["neutral_coords"][0],
-            smplx_one,
-            debug=False,
-            mesh_meta=query_points["mesh_meta"],
-        )
-        if not anim_models:
-            cano_gs = model.inference_gs(
-                gs_model_list,
-                query_points,
-                gs_smplx,
-                render_c2ws,
-                render_intrs,
-                render_bg_colors,
-                gs_hidden_features,
-                pad_forward=False,
-            )
-        else:
-            cano_gs = anim_models[0]
-    else:
-        cano_gs = model.inference_gs(
-            gs_model_list,
-            query_points,
-            gs_smplx,
-            render_c2ws,
-            render_intrs,
-            render_bg_colors,
-            gs_hidden_features,
-            pad_forward=False,
-        )
-    out_abs = os.path.abspath(output_ply)
-    out_dir = os.path.dirname(out_abs)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-    cano_gs.save_ply(out_abs)
-    if export_animation_pose:
-        print(f"Saved SMPL-X pose Gaussian PLY to {out_abs}")
-    else:
-        print(f"Saved T-pose canonical Gaussian PLY to {out_abs}")
+    preview_frames = _render_sequence_frames(
+        model,
+        infer_ctx,
+        motion_seq,
+        infer_output_renderer=video_renderer,
+    )
+    video_path = os.path.join(out_dir, "preview.mp4")
+    images_to_video(
+        preview_frames,
+        output_path=video_path,
+        fps=video_fps,
+        gradio_codec=False,
+        verbose=True,
+    )
+    print(
+        f"Saved pose-sequence package to {out_dir} "
+        f"(canonical PLY + {frame_count} posed PLYs + preview video)"
+    )
 
 
 def setup_loaders_and_inputs(args: argparse.Namespace):
@@ -749,10 +1102,13 @@ def setup_loaders_and_inputs(args: argparse.Namespace):
     imgs_pil = [Image.open(p) for p in image_paths]
     image_for_prepare = [(np.asarray(img),) for img in imgs_pil]
 
-    out_parent = os.path.dirname(os.path.abspath(args.output))
-    if not out_parent:
-        out_parent = os.getcwd()
-    work_dir_path = args.work_dir or os.path.join(out_parent, "debug", "tpose_gs_work")
+    output_abs = os.path.abspath(args.output)
+    if _pose_input_mode(args) == "pose_sequence":
+        os.makedirs(output_abs, exist_ok=True)
+        work_base = output_abs
+    else:
+        work_base = os.path.dirname(output_abs) or os.getcwd()
+    work_dir_path = args.work_dir or os.path.join(work_base, "debug", "tpose_gs_work")
     os.makedirs(work_dir_path, exist_ok=True)
     working_dir = SimpleNamespace()
     working_dir.name = os.path.abspath(work_dir_path)
@@ -763,9 +1119,14 @@ def setup_loaders_and_inputs(args: argparse.Namespace):
     with Image.fromarray(sample_imgs) as img:
         img.save(save_sample_imgs)
 
-    pose_json = _effective_pose_dir(args)
-    if pose_json is not None:
+    pose_mode = _pose_input_mode(args)
+    pose_json = _resolved_pose_input(args)
+    if pose_mode == "single_pose":
+        assert pose_json is not None
         motion_seqs = _build_motion_seq_from_pose_json(pose_json, cfg)
+    elif pose_mode == "pose_sequence":
+        assert pose_json is not None
+        motion_seqs = _build_motion_seq_from_pose_dir(pose_json, cfg)
     else:
         motion_seqs = _build_synthetic_motion_seq(cfg)
 
@@ -791,6 +1152,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.output is None:
         args.output = default_export_output_path(args)
+    pose_mode = _pose_input_mode(args)
 
     os.environ.update(
         {
@@ -811,14 +1173,25 @@ def main() -> None:
         device,
     ) = setup_loaders_and_inputs(args)
 
-    run_tpose_export(
-        model,
-        ref_imgs_tensor,
-        motion_seqs,
-        device=device,
-        output_ply=os.path.abspath(args.output),
-        export_animation_pose=_effective_pose_dir(args) is not None,
-    )
+    if pose_mode == "pose_sequence":
+        run_pose_sequence_export(
+            model,
+            ref_imgs_tensor,
+            motion_seqs,
+            device=device,
+            output_dir=os.path.abspath(args.output),
+            video_fps=args.video_fps,
+            video_renderer=args.video_renderer,
+        )
+    else:
+        run_tpose_export(
+            model,
+            ref_imgs_tensor,
+            motion_seqs,
+            device=device,
+            output_ply=os.path.abspath(args.output),
+            export_animation_pose=pose_mode == "single_pose",
+        )
 
 
 if __name__ == "__main__":

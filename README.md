@@ -283,8 +283,9 @@ Run from the repo root (`LHM-plusplus`), after [environment setup](#environment-
 |------|---------|--------------|
 | **T-pose (canonical)** | Omit **`--pose_dir`** (empty / default) | Gaussians in **canonical T-pose** SMPL-X space, with a **synthetic** single-frame camera when no motion file is provided. |
 | **Any-pose (given SMPL-X frame)** | Set **`--pose_dir`** to **one** SMPL-X JSON | Gaussians **warped to that frame’s body pose** (and that JSON’s camera intrinsics are used in the forward pass). Not the full video / mask pipeline—only that file is read. |
+| **Pose sequence package** | Set **`--pose_dir`** to a **directory** of per-frame SMPL-X JSONs | One output folder containing **`cano_gs.ply`**, **`frame_*.ply`** for every JSON, and a rendered **`preview.mp4`**. |
 
-**Pipeline (current implementation):** Both modes run `infer_single_view` on your reference images. **T-pose** then builds canonical SMPL-X angles and calls **`model.inference_gs`** → `save_ply`. **Any-pose** builds SMPL-X from the JSON and saves the **first posed view** from **`model.renderer.animate_gs_model`** (same Gaussian warp as **`forward_animate_gs`** in the renderer). If that path returns no posed models, the script **falls back** to **`model.inference_gs`**.
+**Pipeline (current implementation):** All modes run `infer_single_view` on your reference images. **T-pose** then builds canonical SMPL-X angles and calls **`model.inference_gs`** → `save_ply`. **Any-pose** builds SMPL-X from the JSON and saves the **first posed view** from **`model.renderer.animate_gs_model`** (same Gaussian warp as **`forward_animate_gs`** in the renderer). If that path returns no posed models, the script **falls back** to **`model.inference_gs`**. **Pose sequence package** reuses the same cached inference context to export **`cano_gs.ply`**, then loops over every JSON to save **`frame_*.ply`**, and finally renders **`preview.mp4`** with `model.animation_infer`.
 
 #### 1) T-pose (canonical GS, no pose JSON)
 
@@ -317,9 +318,30 @@ python scripts/inference/to_gs_ply.py \
   --image_glob "./assets/example_multi_images/00000_yuliang_*.png"
 ```
 
-**Optional:** `--output /path/to/out.ply` overrides the defaults above; `--model_path /path/to/LHMPP-700M-SMPLX-FREE` uses local weights while keeping `--model_name` for the YAML config.
+#### 3) Export a full pose-sequence package (JSON folder)
 
-Useful flags: `--images_dir`, `--ref_view`, `--device`, `--work_dir`. Shape-from-image **betas** follow the app when `use_smplx_shape_estimator` is enabled in config (same as Gradio).
+Pass **`--pose_dir`** to a directory of per-frame SMPL-X JSONs, typically a `smplx_params/` folder. The script exports a directory containing:
+
+* `cano_gs.ply`
+* `frame_00000.ply`, `frame_00001.ply`, ...
+* `preview.mp4`
+
+**Default output directory:** `<repo>/outputs/animation_output/{sequence_name}/{ref_images_parent}/`
+
+```bash
+cd LHM-plusplus
+
+python scripts/inference/to_gs_ply.py \
+  --model_name LHMPP-700M-SMPLX-FREE \
+  --pose_dir "./motion_video/BasketBall_I/smplx_params" \
+  --image_glob "./assets/example_multi_images/00000_yuliang_*.png" \
+  --video_renderer gs \
+  --video_fps 30
+```
+
+**Optional:** `--output /path/to/out.ply` overrides the defaults for T-pose or single-JSON mode; in JSON-folder mode `--output` should be a directory path. `--model_path /path/to/LHMPP-700M-SMPLX-FREE` uses local weights while keeping `--model_name` for the YAML config.
+
+Useful flags: `--images_dir`, `--ref_view`, `--device`, `--work_dir`, `--video_renderer`, `--video_fps`. Shape-from-image **betas** follow the app when `use_smplx_shape_estimator` is enabled in config (same as Gradio).
 
 **Running Tips:** Ensure the input images are high resolution, preferably with visible hand details, and include at least one image where the body is fully extended/spread out.
 

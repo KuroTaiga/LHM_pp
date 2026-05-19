@@ -285,8 +285,9 @@ python ./app.py --model_name LHMPP-700M-SMPLX-FREE --gs
 |------|----------|----------|
 | **T-pose（规范空间）** | **不传**或**留空** `--pose_dir`（默认） | 在 **规范 T-pose** SMPL-X 角空间下的高斯；无动作文件时用 **合成** 单帧相机。 |
 | **任意姿态（单帧 SMPL-X）** | 将 **`--pose_dir`** 设为 **一个** SMPL-X JSON | 高斯经 **`animate_gs_model`** 形变到 **该 JSON 对应帧** 的身体姿态；该文件里的相机内参等会参与前向。不走视频 / mask 整段管线，**只读该 JSON**。 |
+| **姿态序列打包导出** | 将 **`--pose_dir`** 设为 **一个** 按帧存放 JSON 的目录 | 输出一个目录，包含 **`cano_gs.ply`**、每帧 **`frame_*.ply`** 以及渲染得到的 **`preview.mp4`**。 |
 
-**实现说明（与当前脚本一致）：** 两种模式都会先对参考图做 `infer_single_view`。**T-pose** 分支再构建规范 SMPL-X，经 **`model.inference_gs`** 后 `save_ply`。**任意姿态** 分支从 JSON 拼 SMPL-X，保存 **`model.renderer.animate_gs_model`** 返回的 **第一站姿态高斯**（与渲染器里 **`forward_animate_gs`** 的 warp 一致）。若该路径未得到姿态高斯，会 **回退** 到 **`model.inference_gs`**。
+**实现说明（与当前脚本一致）：** 三种模式都会先对参考图做 `infer_single_view`。**T-pose** 分支再构建规范 SMPL-X，经 **`model.inference_gs`** 后 `save_ply`。**任意姿态** 分支从 JSON 拼 SMPL-X，保存 **`model.renderer.animate_gs_model`** 返回的 **第一站姿态高斯**（与渲染器里 **`forward_animate_gs`** 的 warp 一致）。若该路径未得到姿态高斯，会 **回退** 到 **`model.inference_gs`**。**姿态序列打包导出** 会复用同一份缓存后的推理上下文，先导出 **`cano_gs.ply`**，再逐帧导出 **`frame_*.ply`**，最后用 `model.animation_infer` 生成 **`preview.mp4`**。
 
 #### 1）输出 T-pose（规范空间、无姿态 JSON）
 
@@ -319,9 +320,30 @@ python scripts/inference/to_gs_ply.py \
   --image_glob "./assets/example_multi_images/00000_yuliang_*.png"
 ```
 
-**可选：** `--output /path/to/out.ply` 覆盖默认路径；`--model_path` 指向本地权重目录时仍需保留 `--model_name` 以加载对应 YAML。
+#### 3）导出完整姿态序列（JSON 文件夹）
 
-常用参数：`--images_dir`、`--ref_view`、`--device`、`--work_dir`。若配置开启 `use_smplx_shape_estimator`，会从图像估计 **betas**，与 Gradio 一致。
+将 **`--pose_dir`** 指向按帧存放 SMPL-X JSON 的目录，通常就是一个 `smplx_params/` 文件夹。脚本会输出一个目录，里面包含：
+
+* `cano_gs.ply`
+* `frame_00000.ply`、`frame_00001.ply`、...
+* `preview.mp4`
+
+**默认输出目录：** `<仓库根>/outputs/animation_output/{序列目录名}/{参考图父目录名}/`
+
+```bash
+cd LHM-plusplus
+
+python scripts/inference/to_gs_ply.py \
+  --model_name LHMPP-700M-SMPLX-FREE \
+  --pose_dir "./motion_video/BasketBall_I/smplx_params" \
+  --image_glob "./assets/example_multi_images/00000_yuliang_*.png" \
+  --video_renderer gs \
+  --video_fps 30
+```
+
+**可选：** `--output /path/to/out.ply` 在 T-pose 或单 JSON 模式下仍表示输出 PLY 路径；在 JSON 文件夹模式下，`--output` 应该传一个输出目录。`--model_path` 指向本地权重目录时仍需保留 `--model_name` 以加载对应 YAML。
+
+常用参数：`--images_dir`、`--ref_view`、`--device`、`--work_dir`、`--video_renderer`、`--video_fps`。若配置开启 `use_smplx_shape_estimator`，会从图像估计 **betas**，与 Gradio 一致。
 
 **运行建议：** 保证输入的图像足够高清，尽量能够看到手部信息，输入中至少有一张图片中身体足够舒展开来。
 
