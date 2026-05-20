@@ -92,6 +92,23 @@ FRAME_VARYING_SMPLX_KEYS = (
     "img_size_wh",
     "expr",
 )
+TORSO_JOINT_NAMES = (
+    "pelvis",
+    "spine1",
+    "spine2",
+    "spine3",
+    "neck",
+    "left_shoulder",
+    "right_shoulder",
+)
+_VIDEO_CAMERA_SMPLX_LAYER_CACHE: dict[str, Any] = {}
+DEFAULT_VIDEO_VIEW_VARIANTS = ("front", "back", "side90", "orbit360")
+VIDEO_VIEW_VARIANT_FILENAMES = {
+    "front": "preview.mp4",
+    "back": "preview_back.mp4",
+    "side90": "preview_side_090.mp4",
+    "orbit360": "preview_orbit360.mp4",
+}
 
 
 def _require_gs_output_model(model_name: str) -> None:
@@ -361,6 +378,43 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             'Sequence-mode preview renderer. "gs" uses Gaussian splat RGB only; '
             '"neural" uses the refinement decoder when available.'
+        ),
+    )
+    parser.add_argument(
+        "--video_camera_mode",
+        type=str,
+        default="torso_first_frame",
+        choices=("torso_first_frame", "legacy"),
+        help=(
+            "Sequence-mode preview camera behavior. "
+            '"torso_first_frame" recenters the video on the first-frame torso, keeps the camera '
+            'about 3m away by default, and widens FOV as needed so the avatar stays in frame. '
+            '"legacy" keeps the original camera/intrinsics from the motion JSONs.'
+        ),
+    )
+    parser.add_argument(
+        "--video_camera_distance",
+        type=float,
+        default=3.0,
+        help="Sequence-mode preview camera distance in meters for torso-centered framing.",
+    )
+    parser.add_argument(
+        "--video_camera_fill_ratio",
+        type=float,
+        default=0.90,
+        help=(
+            "Sequence-mode preview framing margin as a fraction of half-frame extent. "
+            "Smaller values leave more border around the avatar."
+        ),
+    )
+    parser.add_argument(
+        "--video_view_variants",
+        type=str,
+        default="front,back,side90,orbit360",
+        help=(
+            "Comma-separated preview videos to render in torso_first_frame mode. "
+            'Supported values: "front", "back", "side90", "orbit360", or "all". '
+            '"front" is written to preview.mp4.'
         ),
     )
     return parser
@@ -633,6 +687,369 @@ def _build_motion_seq_from_pose_dir(pose_dir: str, cfg: Any) -> dict[str, Any]:
     base["ori_size"] = (tgt_h, tgt_w)
     base["motion_seqs"] = json_paths
     return base
+
+
+def _clone_motion_seq(motion_seq: dict[str, Any]) -> dict[str, Any]:
+    """Clone tensor fields in a motion sequence so camera overrides stay local."""
+    cloned: dict[str, Any] = {}
+    for key, value in motion_seq.items():
+        if isinstance(value, torch.Tensor):
+            cloned[key] = value.clone()
+        elif isinstance(value, dict):
+            cloned[key] = {
+                sub_key: sub_value.clone() if isinstance(sub_value, torch.Tensor) else sub_value
+                for sub_key, sub_value in value.items()
+            }
+        elif isinstance(value, list):
+            cloned[key] = list(value)
+        else:
+            cloned[key] = value
+    return cloned
+
+
+def _normalize_vec(vec: torch.Tensor, fallback: torch.Tensor) -> torch.Tensor:
+    """Normalize a vector and fall back to a supplied direction if it is near-zero."""
+    norm = float(vec.norm().item())
+    if norm <= 1e-6:
+        fallback = fallback.to(device=vec.device, dtype=vec.dtype)
+        fallback_norm = float(fallback.norm().item())
+        if fallback_norm <= 1e-6:
+            raise ValueError("Fallback vector for normalization must be non-zero.")
+        return fallback / fallback_norm
+    return vec / norm
+
+
+def _parse_video_view_variants(spec: str) -> list[str]:
+    """Parse a comma-separated list of preview video variants."""
+    if spec is None:
+        return list(DEFAULT_VIDEO_VIEW_VARIANTS)
+
+    aliases = {
+        "side": "side90",
+        "side_90": "side90",
+        "orbit": "orbit360",
+        "orbit_360": "orbit360",
+    }
+    tokens = [tok.strip().lower() for tok in re.split(r"[\s,]+", spec) if tok.strip()]
+    if not tokens or "all" in tokens:
+        return list(DEFAULT_VIDEO_VIEW_VARIANTS)
+
+    variants: list[str] = []
+    for token in tokens:
+        variant = aliases.get(token, token)
+        if variant not in VIDEO_VIEW_VARIANT_FILENAMES:
+            supported = ", ".join(("all",) + tuple(VIDEO_VIEW_VARIANT_FILENAMES.keys()))
+            raise ValueError(
+                f"Unsupported --video_view_variants value {token!r}. Supported: {supported}"
+            )
+        if variant not in variants:
+            variants.append(variant)
+    return variants
+
+
+def _get_video_camera_smplx_layer(human_model_path: str):
+    """Build or reuse a lightweight SMPL-X layer for preview camera framing."""
+    cache_key = os.path.abspath(human_model_path)
+    if cache_key not in _VIDEO_CAMERA_SMPLX_LAYER_CACHE:
+        from core.models.rendering.smplx import smplx
+
+        layer_arg = {
+            "create_global_orient": False,
+            "create_body_pose": False,
+            "create_left_hand_pose": False,
+            "create_right_hand_pose": False,
+            "create_jaw_pose": False,
+            "create_leye_pose": False,
+            "create_reye_pose": False,
+            "create_betas": False,
+            "create_expression": False,
+            "create_transl": False,
+        }
+        _VIDEO_CAMERA_SMPLX_LAYER_CACHE[cache_key] = smplx.create(
+            human_model_path,
+            "smplx",
+            gender="neutral",
+            num_betas=10,
+            num_expression_coeffs=100,
+            use_pca=False,
+            use_face_contour=False,
+            flat_hand_mean=True,
+            **layer_arg,
+        )
+    return _VIDEO_CAMERA_SMPLX_LAYER_CACHE[cache_key]
+
+
+def _unbatch_motion_smplx_params(
+    smplx_params_batched: dict[str, torch.Tensor]
+) -> dict[str, torch.Tensor]:
+    """Convert motion-seq SMPL-X tensors from [1, T, ...] to [T, ...] where applicable."""
+    out: dict[str, torch.Tensor] = {}
+    for key, value in smplx_params_batched.items():
+        if not isinstance(value, torch.Tensor):
+            continue
+        if key == "betas":
+            out[key] = value[0].clone() if value.dim() == 2 and value.shape[0] == 1 else value.clone()
+        elif value.dim() >= 2 and value.shape[0] == 1:
+            out[key] = value[0].clone()
+        else:
+            out[key] = value.clone()
+    return out
+
+
+def _compute_preview_camera_from_first_frame_torso(
+    motion_seq: dict[str, Any],
+    *,
+    human_model_path: str,
+    distance_m: float,
+    fill_ratio: float,
+) -> dict[str, torch.Tensor]:
+    """Analyze the first frame and body geometry for preview-camera construction."""
+    from core.models.rendering.smplx.smplx.joint_names import JOINT_NAMES
+
+    if distance_m <= 0:
+        raise ValueError(f"--video_camera_distance must be > 0, got {distance_m}")
+
+    smplx_params = _unbatch_motion_smplx_params(motion_seq["smplx_params"])
+    device = smplx_params["body_pose"].device
+    dtype = smplx_params["body_pose"].dtype
+    smplx_layer = _get_video_camera_smplx_layer(human_model_path).to(device)
+
+    num_frames = int(smplx_params["body_pose"].shape[0])
+    expr = smplx_params.get(
+        "expr",
+        torch.zeros((num_frames, 100), device=device, dtype=dtype),
+    )
+    output = smplx_layer(
+        global_orient=smplx_params["root_pose"].view(num_frames, -1),
+        body_pose=smplx_params["body_pose"].view(num_frames, -1),
+        left_hand_pose=smplx_params["lhand_pose"].view(num_frames, -1),
+        right_hand_pose=smplx_params["rhand_pose"].view(num_frames, -1),
+        jaw_pose=smplx_params["jaw_pose"].view(num_frames, -1),
+        leye_pose=smplx_params["leye_pose"].view(num_frames, -1),
+        reye_pose=smplx_params["reye_pose"].view(num_frames, -1),
+        expression=expr.view(num_frames, -1),
+        betas=smplx_params["betas"].view(1, -1).repeat(num_frames, 1),
+        transl=smplx_params["trans"].view(num_frames, -1),
+        face_offset=None,
+        joint_offset=None,
+    )
+    vertices = output.vertices.float()
+    joints = output.joints.float()
+
+    torso_indices = [JOINT_NAMES.index(name) for name in TORSO_JOINT_NAMES]
+    torso_center = joints[0, torso_indices].mean(dim=0)
+    pelvis = joints[0, JOINT_NAMES.index("pelvis")]
+    neck = joints[0, JOINT_NAMES.index("neck")]
+
+    width = height = 0
+    if "img_size_wh" in smplx_params:
+        width = int(round(float(smplx_params["img_size_wh"][0, 0].item())))
+        height = int(round(float(smplx_params["img_size_wh"][0, 1].item())))
+    if width <= 0 or height <= 0:
+        width = int(round(float(motion_seq["render_intrs"][0, 0, 0, 2].item() * 2)))
+        height = int(round(float(motion_seq["render_intrs"][0, 0, 1, 2].item() * 2)))
+
+    up_dir = _normalize_vec(
+        neck - pelvis,
+        torch.tensor([0.0, 0.0, 1.0], device=device, dtype=dtype),
+    )
+
+    return {
+        "vertices": vertices.to(dtype=dtype),
+        "rotation_center": pelvis.to(dtype=dtype),
+        "torso_center": torso_center.to(dtype=dtype),
+        "up_dir": up_dir.to(dtype=dtype),
+        "img_size_wh": torch.tensor([float(width), float(height)], dtype=dtype, device=device),
+        "distance_m": torch.tensor(float(distance_m), dtype=dtype, device=device),
+        "fill_ratio": torch.tensor(float(fill_ratio), dtype=dtype, device=device),
+    }
+
+
+def _axis_angle_rotation_matrices(
+    axis: torch.Tensor,
+    angles_rad: torch.Tensor,
+) -> torch.Tensor:
+    """Build batched 3x3 rotation matrices around an arbitrary axis."""
+    axis = _normalize_vec(
+        axis,
+        torch.tensor([0.0, 0.0, 1.0], device=axis.device, dtype=axis.dtype),
+    )
+    x, y, z = axis
+    zero = torch.zeros((), dtype=axis.dtype, device=axis.device)
+    K = torch.stack(
+        [
+            torch.stack([zero, -z, y]),
+            torch.stack([z, zero, -x]),
+            torch.stack([-y, x, zero]),
+        ]
+    )
+    eye = torch.eye(3, dtype=axis.dtype, device=axis.device)
+    outer = axis.view(3, 1) @ axis.view(1, 3)
+    cos_term = torch.cos(angles_rad).view(-1, 1, 1)
+    sin_term = torch.sin(angles_rad).view(-1, 1, 1)
+    return cos_term * eye + (1.0 - cos_term) * outer + sin_term * K
+
+
+def _world_to_camera_points(vertices: torch.Tensor, c2ws: torch.Tensor) -> torch.Tensor:
+    """Project per-frame world vertices into camera coordinates."""
+    w2cs = torch.inverse(c2ws)
+    ones = torch.ones((*vertices.shape[:2], 1), device=vertices.device, dtype=vertices.dtype)
+    vertices_h = torch.cat([vertices, ones], dim=-1)
+    return torch.einsum("tij,tkj->tki", w2cs, vertices_h)[..., :3]
+
+
+def _fit_preview_camera_path(
+    vertices: torch.Tensor,
+    c2ws: torch.Tensor,
+    *,
+    width: int,
+    height: int,
+    fill_ratio: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fit preview intrinsics for a fixed camera path while keeping the exact camera distance."""
+    frame_margin = max(0.05, min(float(fill_ratio), 0.98))
+    camera_points = _world_to_camera_points(vertices, c2ws)
+    min_depth = float(camera_points[..., 2].min().item())
+    if min_depth <= 1e-4:
+        raise ValueError(
+            "Preview camera intersects or passes through the avatar. "
+            "Increase --video_camera_distance."
+        )
+
+    cx = width / 2.0
+    cy = height / 2.0
+    z = camera_points[..., 2].clamp_min(1e-3)
+    x_ratio_max = float((camera_points[..., 0].abs() / z).max().item())
+    y_ratio_max = float((camera_points[..., 1].abs() / z).max().item())
+    fx_fit = (cx * frame_margin) / max(x_ratio_max, 1e-6)
+    fy_fit = (cy * frame_margin) / max(y_ratio_max, 1e-6)
+    focal = float(min(fx_fit, fy_fit))
+
+    intr = torch.eye(4, dtype=vertices.dtype, device=vertices.device)
+    intr[0, 0] = focal
+    intr[1, 1] = focal
+    intr[0, 2] = cx
+    intr[1, 2] = cy
+    img_size_wh = torch.tensor([float(width), float(height)], dtype=vertices.dtype, device=vertices.device)
+    return c2ws, intr, img_size_wh
+
+
+def _build_preview_camera_positions(
+    camera_state: dict[str, torch.Tensor],
+    *,
+    variant: str,
+    num_frames: int,
+) -> torch.Tensor:
+    """Build camera-to-world transforms by orbiting the original working camera around the avatar."""
+    rotation_center = camera_state["rotation_center"]
+    up_dir = camera_state["up_dir"]
+    distance = float(camera_state["distance_m"].item())
+    dtype = rotation_center.dtype
+    device = rotation_center.device
+
+    if variant == "back":
+        angles = torch.zeros(num_frames, device=device, dtype=dtype)
+    elif variant == "front":
+        angles = torch.full((num_frames,), math.pi, device=device, dtype=dtype)
+    elif variant == "side90":
+        angles = torch.full((num_frames,), 1.5 * math.pi, device=device, dtype=dtype)
+    elif variant == "orbit360":
+        angles = torch.linspace(
+            math.pi,
+            3.0 * math.pi,
+            num_frames + 1,
+            device=device,
+            dtype=dtype,
+        )[:-1]
+    else:
+        raise ValueError(f"Unsupported preview variant: {variant}")
+
+    rotations = _axis_angle_rotation_matrices(up_dir, angles)
+    base_offset = torch.tensor([0.0, 0.0, -distance], dtype=dtype, device=device)
+    camera_offsets = torch.einsum("tij,j->ti", rotations, base_offset)
+    camera_positions = rotation_center.view(1, 3) + camera_offsets
+
+    c2ws = torch.eye(4, dtype=dtype, device=device).unsqueeze(0).repeat(num_frames, 1, 1)
+    c2ws[:, :3, :3] = rotations
+    c2ws[:, :3, 3] = camera_positions
+    return c2ws
+
+
+def _build_preview_motion_seq_variant(
+    motion_seq: dict[str, Any],
+    *,
+    camera_state: dict[str, torch.Tensor],
+    variant: str,
+) -> dict[str, Any]:
+    """Return one preview-ready motion sequence for a specific camera variant."""
+    framed = _clone_motion_seq(motion_seq)
+    num_frames = int(framed["render_c2ws"].shape[1])
+    width = int(round(float(camera_state["img_size_wh"][0].item())))
+    height = int(round(float(camera_state["img_size_wh"][1].item())))
+    fill_ratio = float(camera_state["fill_ratio"].item())
+
+    c2ws = _build_preview_camera_positions(
+        camera_state,
+        variant=variant,
+        num_frames=num_frames,
+    )
+    c2ws, intr, img_size_wh = _fit_preview_camera_path(
+        camera_state["vertices"],
+        c2ws,
+        width=width,
+        height=height,
+        fill_ratio=fill_ratio,
+    )
+
+    framed["render_c2ws"] = c2ws.unsqueeze(0).clone()
+    framed["render_intrs"] = intr.view(1, 1, 4, 4).expand(1, num_frames, 4, 4).clone()
+
+    smplx_params = framed["smplx_params"]
+    focal_pair = intr[[0, 1], [0, 1]].view(1, 1, 2).expand(1, num_frames, 2).clone()
+    princpt = intr[[0, 1], [2, 2]].view(1, 1, 2).expand(1, num_frames, 2).clone()
+    size_wh = img_size_wh.view(1, 1, 2).expand(1, num_frames, 2).clone()
+    if "focal" in smplx_params:
+        smplx_params["focal"] = focal_pair
+    if "princpt" in smplx_params:
+        smplx_params["princpt"] = princpt
+    if "img_size_wh" in smplx_params:
+        smplx_params["img_size_wh"] = size_wh
+
+    framed["ori_size"] = (
+        int(round(float(img_size_wh[1].item()))),
+        int(round(float(img_size_wh[0].item()))),
+    )
+    return framed
+
+
+def _apply_sequence_preview_camera_mode(
+    motion_seq: dict[str, Any],
+    *,
+    camera_mode: str,
+    human_model_path: str,
+    distance_m: float,
+    fill_ratio: float,
+    view_variants: list[str],
+) -> dict[str, dict[str, Any]]:
+    """Return preview-render motion sequences keyed by output filename."""
+    if camera_mode == "legacy":
+        return {"preview.mp4": motion_seq}
+
+    camera_state = _compute_preview_camera_from_first_frame_torso(
+        motion_seq,
+        human_model_path=human_model_path,
+        distance_m=distance_m,
+        fill_ratio=fill_ratio,
+    )
+    previews: dict[str, dict[str, Any]] = {}
+    for variant in view_variants:
+        out_name = VIDEO_VIEW_VARIANT_FILENAMES[variant]
+        previews[out_name] = _build_preview_motion_seq_variant(
+            motion_seq,
+            camera_state=camera_state,
+            variant=variant,
+        )
+    return previews
 
 
 def slice_motion_seq_to_single_frame(
@@ -972,6 +1389,11 @@ def _render_sequence_frames(
     return np.concatenate(batch_rgb_list, axis=0)
 
 
+def _rotate_preview_frames_180(preview_frames: np.ndarray) -> np.ndarray:
+    """Rotate preview frames by 180 degrees in image space to correct the upside-down output."""
+    return np.rot90(preview_frames, 2, axes=(1, 2)).copy()
+
+
 @torch.no_grad()
 def run_tpose_export(
     model: torch.nn.Module,
@@ -1011,6 +1433,10 @@ def run_pose_sequence_export(
     *,
     video_fps: int,
     video_renderer: str,
+    video_camera_mode: str,
+    video_camera_distance: float,
+    video_camera_fill_ratio: float,
+    video_view_variants: list[str],
 ) -> None:
     """Export a canonical PLY, frame-wise posed PLYs, and a preview MP4 for a pose JSON folder."""
     out_dir = os.path.abspath(output_dir)
@@ -1039,23 +1465,38 @@ def run_pose_sequence_export(
             export_animation_pose=True,
         )
 
-    preview_frames = _render_sequence_frames(
-        model,
-        infer_ctx,
+    human_model_path = os.path.join(_LHM_ROOT, "pretrained_models", "human_model_files")
+    preview_motion_seqs = _apply_sequence_preview_camera_mode(
         motion_seq,
-        infer_output_renderer=video_renderer,
+        camera_mode=video_camera_mode,
+        human_model_path=human_model_path,
+        distance_m=video_camera_distance,
+        fill_ratio=video_camera_fill_ratio,
+        view_variants=video_view_variants,
     )
-    video_path = os.path.join(out_dir, "preview.mp4")
-    images_to_video(
-        preview_frames,
-        output_path=video_path,
-        fps=video_fps,
-        gradio_codec=False,
-        verbose=True,
-    )
+    video_outputs: list[str] = []
+    for video_name, preview_motion_seq in preview_motion_seqs.items():
+        preview_frames = _render_sequence_frames(
+            model,
+            infer_ctx,
+            preview_motion_seq,
+            infer_output_renderer=video_renderer,
+        )
+        if video_camera_mode != "legacy":
+            preview_frames = _rotate_preview_frames_180(preview_frames)
+        video_path = os.path.join(out_dir, video_name)
+        images_to_video(
+            preview_frames,
+            output_path=video_path,
+            fps=video_fps,
+            gradio_codec=False,
+            verbose=True,
+        )
+        video_outputs.append(video_name)
     print(
         f"Saved pose-sequence package to {out_dir} "
-        f"(canonical PLY + {frame_count} posed PLYs + preview video)"
+        f"(canonical PLY + {frame_count} posed PLYs + videos: {', '.join(video_outputs)}, "
+        f"camera_mode={video_camera_mode})"
     )
 
 
@@ -1153,6 +1594,7 @@ def main() -> None:
     if args.output is None:
         args.output = default_export_output_path(args)
     pose_mode = _pose_input_mode(args)
+    video_view_variants = _parse_video_view_variants(args.video_view_variants)
 
     os.environ.update(
         {
@@ -1182,6 +1624,10 @@ def main() -> None:
             output_dir=os.path.abspath(args.output),
             video_fps=args.video_fps,
             video_renderer=args.video_renderer,
+            video_camera_mode=args.video_camera_mode,
+            video_camera_distance=args.video_camera_distance,
+            video_camera_fill_ratio=args.video_camera_fill_ratio,
+            video_view_variants=video_view_variants,
         )
     else:
         run_tpose_export(

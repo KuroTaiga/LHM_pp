@@ -48,7 +48,7 @@ For English readers, see [README in English](./README.md).
 
 ### 新功能
 
-- **导出 `gs.ply`：** 运行 [`scripts/inference/to_gs_ply.py`](./scripts/inference/to_gs_ply.py)，将 **3D Gaussian Splatting** 存为标准 **`.ply`**：**规范 T-pose**（不传或留空 `--pose_dir`）或 **单帧 SMPL-X JSON**（`--pose_dir` 指向某一帧参数）。仅支持 **`LHMPP-700M-SMPLX-FREE`**（见 [`GS_RENDER_SUPPORTED_MODEL_NAMES`](./core/utils/model_card.py)）。完整说明见下文 **快速开始 → 导出 GS PLY（`to_gs_ply.py`）**。
+- **导出 `gs.ply`：** 运行 [`scripts/inference/to_gs_ply.py`](./scripts/inference/to_gs_ply.py)，将 **3D Gaussian Splatting** 存为标准 **`.ply`**：既支持 **规范 T-pose**（不传或留空 `--pose_dir`），也支持 **单帧 SMPL-X JSON**（`--pose_dir` 指向某一帧参数），还支持 **整段 JSON 文件夹打包导出**（`cano_gs.ply` + `frame_*.ply` + `preview.mp4`）。仅支持 **`LHMPP-700M-SMPLX-FREE`**（见 [`GS_RENDER_SUPPORTED_MODEL_NAMES`](./core/utils/model_card.py)）。完整说明见下文 **快速开始 → 导出 GS PLY（`to_gs_ply.py`）**。
 - **GS 渲染结果：** 在 [`app.py`](./app.py) 中使用 **`gs_render`**，仅由高斯光栅得到 **RGB**（不走神经细化解码器）。加载 **`LHMPP-700M-SMPLX-FREE`** 时可用启动参数 **`--gs`**，或在界面中将 **Output Renderer** 切到 **gs_render**。详见下文 **本地 Gradio 运行**。
 
 ### TODO List
@@ -285,9 +285,9 @@ python ./app.py --model_name LHMPP-700M-SMPLX-FREE --gs
 |------|----------|----------|
 | **T-pose（规范空间）** | **不传**或**留空** `--pose_dir`（默认） | 在 **规范 T-pose** SMPL-X 角空间下的高斯；无动作文件时用 **合成** 单帧相机。 |
 | **任意姿态（单帧 SMPL-X）** | 将 **`--pose_dir`** 设为 **一个** SMPL-X JSON | 高斯经 **`animate_gs_model`** 形变到 **该 JSON 对应帧** 的身体姿态；该文件里的相机内参等会参与前向。不走视频 / mask 整段管线，**只读该 JSON**。 |
-| **姿态序列打包导出** | 将 **`--pose_dir`** 设为 **一个** 按帧存放 JSON 的目录 | 输出一个目录，包含 **`cano_gs.ply`**、每帧 **`frame_*.ply`** 以及渲染得到的 **`preview.mp4`**。 |
+| **姿态序列打包导出** | 将 **`--pose_dir`** 设为 **一个** 按帧存放 JSON 的目录 | 输出一个目录，包含 **`cano_gs.ply`**、每帧 **`frame_*.ply`** 以及渲染得到的 **`preview.mp4`**。默认会把预览视频相机重心对准**第一帧 torso**，并保持约 **3 米**距离。 |
 
-**实现说明（与当前脚本一致）：** 三种模式都会先对参考图做 `infer_single_view`。**T-pose** 分支再构建规范 SMPL-X，经 **`model.inference_gs`** 后 `save_ply`。**任意姿态** 分支从 JSON 拼 SMPL-X，保存 **`model.renderer.animate_gs_model`** 返回的 **第一站姿态高斯**（与渲染器里 **`forward_animate_gs`** 的 warp 一致）。若该路径未得到姿态高斯，会 **回退** 到 **`model.inference_gs`**。**姿态序列打包导出** 会复用同一份缓存后的推理上下文，先导出 **`cano_gs.ply`**，再逐帧导出 **`frame_*.ply`**，最后用 `model.animation_infer` 生成 **`preview.mp4`**。
+**实现说明（与当前脚本一致）：** 三种模式都会先对参考图做 `infer_single_view`。**T-pose** 分支再构建规范 SMPL-X，经 **`model.inference_gs`** 后 `save_ply`。**任意姿态** 分支从 JSON 拼 SMPL-X，保存 **`model.renderer.animate_gs_model`** 返回的 **第一站姿态高斯**（与渲染器里 **`forward_animate_gs`** 的 warp 一致）。若该路径未得到姿态高斯，会 **回退** 到 **`model.inference_gs`**。**姿态序列打包导出** 会复用同一份缓存后的推理上下文，先导出 **`cano_gs.ply`**，再逐帧导出 **`frame_*.ply`**，最后用 `model.animation_infer` 生成 **`preview.mp4`**；默认预览视频会固定使用**第一帧 torso 居中**的相机，也保留了 **legacy** 开关以继续使用原始动作 JSON 中的相机。
 
 #### 1）输出 T-pose（规范空间、无姿态 JSON）
 
@@ -326,9 +326,14 @@ python scripts/inference/to_gs_ply.py \
 
 * `cano_gs.ply`
 * `frame_00000.ply`、`frame_00001.ply`、...
-* `preview.mp4`
+* `preview.mp4`（纠正后的正面视角）
+* `preview_back.mp4`（纠正后的背面视角）
+* `preview_side_090.mp4`（水平旋转 90° 的侧面视角）
+* `preview_orbit360.mp4`（整段视频内绕 torso 水平环绕一圈）
 
 **默认输出目录：** `<仓库根>/outputs/animation_output/{序列目录名}/{参考图父目录名}/`
+
+默认启用 `--video_camera_mode torso_first_frame`：预览相机会以第一帧的 torso 为中心，保持人物竖直，默认放在 `--video_camera_distance 3.0` 米左右的位置，并在需要时自动调宽视角，尽量保证整个人都在画面内。此时 `preview.mp4` 为纠正后的正面视角，额外生成的几个视频可用于查看背面、侧面和 360° 环绕效果。若想继续沿用动作 JSON 自带的相机轨迹和内参，并且只输出 `preview.mp4`，可切换到 `--video_camera_mode legacy`。`--video_camera_fill_ratio` 可控制人物在画面中的留白多少，`--video_view_variants` 可指定只输出部分视角（例如 `front,orbit360`）。
 
 ```bash
 cd LHM-plusplus
@@ -343,7 +348,7 @@ python scripts/inference/to_gs_ply.py \
 
 **可选：** `--output /path/to/out.ply` 在 T-pose 或单 JSON 模式下仍表示输出 PLY 路径；在 JSON 文件夹模式下，`--output` 应该传一个输出目录。`--model_path` 指向本地权重目录时仍需保留 `--model_name` 以加载对应 YAML。
 
-常用参数：`--images_dir`、`--ref_view`、`--device`、`--work_dir`、`--video_renderer`、`--video_fps`。若配置开启 `use_smplx_shape_estimator`，会从图像估计 **betas**，与 Gradio 一致。
+常用参数：`--images_dir`、`--ref_view`、`--device`、`--work_dir`、`--video_renderer`、`--video_fps`、`--video_camera_mode`、`--video_camera_distance`、`--video_camera_fill_ratio`、`--video_view_variants`。若配置开启 `use_smplx_shape_estimator`，会从图像估计 **betas**，与 Gradio 一致。
 
 **运行建议：** 保证输入的图像足够高清，尽量能够看到手部信息，输入中至少有一张图片中身体足够舒展开来。
 

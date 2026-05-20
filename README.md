@@ -47,7 +47,7 @@ If you prefer Chinese documentation, please see the [Chinese README](./README_CN
 
 ### New features
 
-- **Export `gs.ply`:** Run [`scripts/inference/to_gs_ply.py`](./scripts/inference/to_gs_ply.py) to save **3D Gaussian Splatting** as a standard **`.ply`**—either **canonical T-pose** (leave `--pose_dir` empty) or **a single SMPL-X JSON frame** (`--pose_dir`). Only **`LHMPP-700M-SMPLX-FREE`** is supported (see [`GS_RENDER_SUPPORTED_MODEL_NAMES`](./core/utils/model_card.py)). Full usage is in **Export Gaussian Splatting PLY (`to_gs_ply.py`)** under **Getting Started** below.
+- **Export `gs.ply`:** Run [`scripts/inference/to_gs_ply.py`](./scripts/inference/to_gs_ply.py) to save **3D Gaussian Splatting** as a standard **`.ply`**—as **canonical T-pose** (leave `--pose_dir` empty), **a single SMPL-X JSON frame** (`--pose_dir` = one JSON), or **a full JSON-folder pose package** (`cano_gs.ply` + `frame_*.ply` + `preview.mp4`). Only **`LHMPP-700M-SMPLX-FREE`** is supported (see [`GS_RENDER_SUPPORTED_MODEL_NAMES`](./core/utils/model_card.py)). Full usage is in **Export Gaussian Splatting PLY (`to_gs_ply.py`)** under **Getting Started** below.
 - **GS render results:** In [`app.py`](./app.py), use **`gs_render`** for **RGB output from Gaussian splatting only** (no neural refinement). Launch with **`--gs`** when the model is **`LHMPP-700M-SMPLX-FREE`**, or switch **Output Renderer** to **gs_render** in the UI. See **Local Gradio Run** below.
 
 ### TODO List
@@ -283,9 +283,9 @@ Run from the repo root (`LHM-plusplus`), after [environment setup](#environment-
 |------|---------|--------------|
 | **T-pose (canonical)** | Omit **`--pose_dir`** (empty / default) | Gaussians in **canonical T-pose** SMPL-X space, with a **synthetic** single-frame camera when no motion file is provided. |
 | **Any-pose (given SMPL-X frame)** | Set **`--pose_dir`** to **one** SMPL-X JSON | Gaussians **warped to that frame’s body pose** (and that JSON’s camera intrinsics are used in the forward pass). Not the full video / mask pipeline—only that file is read. |
-| **Pose sequence package** | Set **`--pose_dir`** to a **directory** of per-frame SMPL-X JSONs | One output folder containing **`cano_gs.ply`**, **`frame_*.ply`** for every JSON, and a rendered **`preview.mp4`**. |
+| **Pose sequence package** | Set **`--pose_dir`** to a **directory** of per-frame SMPL-X JSONs | One output folder containing **`cano_gs.ply`**, **`frame_*.ply`** for every JSON, and a rendered **`preview.mp4`**. By default, the preview camera is recentered to the **first-frame torso** and placed about **3m** away. |
 
-**Pipeline (current implementation):** All modes run `infer_single_view` on your reference images. **T-pose** then builds canonical SMPL-X angles and calls **`model.inference_gs`** → `save_ply`. **Any-pose** builds SMPL-X from the JSON and saves the **first posed view** from **`model.renderer.animate_gs_model`** (same Gaussian warp as **`forward_animate_gs`** in the renderer). If that path returns no posed models, the script **falls back** to **`model.inference_gs`**. **Pose sequence package** reuses the same cached inference context to export **`cano_gs.ply`**, then loops over every JSON to save **`frame_*.ply`**, and finally renders **`preview.mp4`** with `model.animation_infer`.
+**Pipeline (current implementation):** All modes run `infer_single_view` on your reference images. **T-pose** then builds canonical SMPL-X angles and calls **`model.inference_gs`** → `save_ply`. **Any-pose** builds SMPL-X from the JSON and saves the **first posed view** from **`model.renderer.animate_gs_model`** (same Gaussian warp as **`forward_animate_gs`** in the renderer). If that path returns no posed models, the script **falls back** to **`model.inference_gs`**. **Pose sequence package** reuses the same cached inference context to export **`cano_gs.ply`**, then loops over every JSON to save **`frame_*.ply`**, and finally renders **`preview.mp4`** with `model.animation_infer`; by default that preview uses a fixed **first-frame torso-centered** camera, with a **legacy** switch if you want the original motion-JSON cameras instead.
 
 #### 1) T-pose (canonical GS, no pose JSON)
 
@@ -324,9 +324,14 @@ Pass **`--pose_dir`** to a directory of per-frame SMPL-X JSONs, typically a `smp
 
 * `cano_gs.ply`
 * `frame_00000.ply`, `frame_00001.ply`, ...
-* `preview.mp4`
+* `preview.mp4` (upright front view)
+* `preview_back.mp4` (upright back view)
+* `preview_side_090.mp4` (90° horizontal side view)
+* `preview_orbit360.mp4` (one full horizontal orbit over the clip)
 
 **Default output directory:** `<repo>/outputs/animation_output/{sequence_name}/{ref_images_parent}/`
+
+With `--video_camera_mode torso_first_frame` (default), the preview cameras are centered on the first frame's torso, kept upright, placed about `--video_camera_distance 3.0` meters away, and the FOV is widened as needed so the avatar stays in frame. `preview.mp4` is the corrected front-facing view, while the extra files provide back / side / orbit inspections. Use `--video_camera_mode legacy` to keep the original camera path/intrinsics from the motion JSONs and render only `preview.mp4`. `--video_camera_fill_ratio` controls how tightly the avatar fills the frame, and `--video_view_variants` lets you choose a subset such as `front,orbit360`.
 
 ```bash
 cd LHM-plusplus
@@ -341,7 +346,7 @@ python scripts/inference/to_gs_ply.py \
 
 **Optional:** `--output /path/to/out.ply` overrides the defaults for T-pose or single-JSON mode; in JSON-folder mode `--output` should be a directory path. `--model_path /path/to/LHMPP-700M-SMPLX-FREE` uses local weights while keeping `--model_name` for the YAML config.
 
-Useful flags: `--images_dir`, `--ref_view`, `--device`, `--work_dir`, `--video_renderer`, `--video_fps`. Shape-from-image **betas** follow the app when `use_smplx_shape_estimator` is enabled in config (same as Gradio).
+Useful flags: `--images_dir`, `--ref_view`, `--device`, `--work_dir`, `--video_renderer`, `--video_fps`, `--video_camera_mode`, `--video_camera_distance`, `--video_camera_fill_ratio`, `--video_view_variants`. Shape-from-image **betas** follow the app when `use_smplx_shape_estimator` is enabled in config (same as Gradio).
 
 **Running Tips:** Ensure the input images are high resolution, preferably with visible hand details, and include at least one image where the body is fully extended/spread out.
 
