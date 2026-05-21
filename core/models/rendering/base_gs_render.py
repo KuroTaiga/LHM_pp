@@ -67,6 +67,7 @@ class BaseGSRender(nn.Module):
         dense_sample_pts=40000,  # only use for dense_smaple_smplx
         gs_deform_scale=0.005,
         render_features=False,
+        flat_hand_mean=False,
     ):
         """
 
@@ -127,6 +128,7 @@ class BaseGSRender(nn.Module):
             "expr_param_dim": expr_param_dim,
             "cano_pose_type": cano_pose_type,
             "apply_pose_blendshape": apply_pose_blendshape,
+            "flat_hand_mean": flat_hand_mean,
         }
         if self.smpl_type in [
             "smplx_skirt",

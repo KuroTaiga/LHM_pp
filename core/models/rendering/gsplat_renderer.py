@@ -66,6 +66,7 @@ class GSPlatRenderer(GS3DRenderer):
         dense_sample_pts=40000,  # only use for dense_smaple_smplx
         gs_deform_scale=0.005,
         render_features=False,
+        flat_hand_mean=False,
     ):
         """
         Initializes the GSPlatRenderer, an extension of GS3DRenderer for Gaussian Splatting rendering.
@@ -123,6 +124,7 @@ class GSPlatRenderer(GS3DRenderer):
                 dense_sample_pts,  # only use for dense_smaple_smplx
                 gs_deform_scale,
                 render_features,
+                flat_hand_mean,
             )
 
     def get_gaussians_properties(self, viewpoint_camera, gaussian_model):
@@ -719,6 +721,7 @@ class GSPlatBackFeatRenderer(GSPlatFeatRenderer):
         dense_sample_pts=40000,  # only use for dense_smaple_smplx
         gs_deform_scale=0.005,
         render_features=False,
+        flat_hand_mean=False,
     ):
         """
         Initializes the GSPlatBackFeatRenderer, an extension of GSPlatFeatRenderer adding a learnable embedding
@@ -748,6 +751,7 @@ class GSPlatBackFeatRenderer(GSPlatFeatRenderer):
             dense_sample_pts (int, optional): Dense sample points for mesh/voxel. Default 40000.
             gs_deform_scale (float, optional): Deformation scale for Gaussian Splatting. Default 0.005.
             render_features (bool, optional): Output additional features in renderer. Default False.
+            flat_hand_mean (bool, optional): Whether zero hand pose should use SMPL-X flat hand mean. Default False.
 
         Adds:
             self.background_embedding (nn.Parameter): Learnable background embedding for enhanced modeling.
@@ -777,6 +781,7 @@ class GSPlatBackFeatRenderer(GSPlatFeatRenderer):
             dense_sample_pts,  # only use for dense_smaple_smplx
             gs_deform_scale,
             render_features,
+            flat_hand_mean,
         )
 
         # learnable positional embedding

@@ -25,8 +25,10 @@ from huggingface_hub import PyTorchModelHubMixin
 
 def wrap_model_hub(model_cls: nn.Module):
     class HfModel(model_cls, PyTorchModelHubMixin):
-        def __init__(self, config: dict):
-            super().__init__(**config)
-            self.config = config
+        def __init__(self, config: dict | None = None, **kwargs):
+            merged_config = dict(config or {})
+            merged_config.update(kwargs)
+            super().__init__(**merged_config)
+            self.config = merged_config
 
     return HfModel

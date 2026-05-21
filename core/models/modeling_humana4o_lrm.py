@@ -461,6 +461,7 @@ class ModelHumanA4OLRM(nn.Module):
             dense_sample_pts=dense_sample_pts,
             gs_deform_scale=gs_deform_scale,
             render_features=render_features,
+            flat_hand_mean=kwargs.get("flat_hand_mean", False),
             **renderer_kwargs,
         )
 

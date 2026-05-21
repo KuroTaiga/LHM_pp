@@ -41,6 +41,7 @@ class GS3DRenderer(BaseGSRender):
         dense_sample_pts=40000,  # only use for dense_smaple_smplx
         gs_deform_scale=0.005,
         render_features=False,
+        flat_hand_mean=False,
     ):
         """
         Initializes the GS3DRenderer, a subclass of BaseGSRender for 3D Gaussian Splatting rendering.
@@ -95,6 +96,7 @@ class GS3DRenderer(BaseGSRender):
             dense_sample_pts,  # only use for dense_smaple_smplx
             gs_deform_scale,
             render_features,
+            flat_hand_mean,
         )
 
         self.gs_net = GSMLPDecoder(

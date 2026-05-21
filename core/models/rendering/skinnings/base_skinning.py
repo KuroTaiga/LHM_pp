@@ -67,6 +67,7 @@ class BaseSkinning:
         expr_param_dim=50,
         subdivide_num=2,
         cano_pose_type=0,
+        flat_hand_mean=False,
     ):
         """
         Initialize the BaseSkinning model with SMPL-X and FLAME integration.
@@ -93,6 +94,11 @@ class BaseSkinning:
         self.expr_param_dim = expr_param_dim
         self.subdivide_num = subdivide_num
         self.cano_pose_type = cano_pose_type
+        if isinstance(flat_hand_mean, str):
+            flat_hand_mean = flat_hand_mean.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            flat_hand_mean = bool(flat_hand_mean)
+        self.flat_hand_mean = flat_hand_mean
 
         # Initialize all components
         self._init_smplx_layers()
@@ -170,7 +176,7 @@ class BaseSkinning:
                 num_expression_coeffs=self.expr_param_dim,
                 use_pca=False,
                 use_face_contour=use_face_contour,
-                flat_hand_mean=True,
+                flat_hand_mean=self.flat_hand_mean,
                 **layer_args
             )
             for gender in ["neutral", "male", "female"]

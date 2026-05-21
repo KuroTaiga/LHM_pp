@@ -567,7 +567,10 @@ def _to_motion_batch_dict(c2ws, intrs, bg_colors, smplx_params, rgbs, vis_motion
 
 
 def render_smplx_mesh(
-    smplx_params, render_intrs, human_model_path="./pretrained_models/human_model_files"
+    smplx_params,
+    render_intrs,
+    human_model_path="./pretrained_models/human_model_files",
+    flat_hand_mean=False,
 ):
     from core.models.rendering.smplx import smplx
     from core.models.rendering.smplx.vis_utils import render_mesh
@@ -593,7 +596,7 @@ def render_smplx_mesh(
         num_expression_coeffs=100,
         use_pca=False,
         use_face_contour=False,
-        flat_hand_mean=True,
+        flat_hand_mean=bool(flat_hand_mean),
         **layer_arg,
     )
 

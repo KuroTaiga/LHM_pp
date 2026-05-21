@@ -90,7 +90,10 @@ def build_app_model(cfg: DictConfig) -> torch.nn.Module:
     from core.models import model_dict
 
     model_cls = wrap_model_hub(model_dict["human_lrm_a4o"])
-    model = model_cls.from_pretrained(cfg.model_name)
+    model = model_cls.from_pretrained(
+        cfg.model_name,
+        flat_hand_mean=cfg.get("flat_hand_mean", False),
+    )
     return model
 
 

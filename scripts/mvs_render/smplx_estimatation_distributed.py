@@ -105,11 +105,13 @@ class EasySMPLX:
         shape_param_dim=10,  # smpl beta
         expr_param_dim=100,  # flame expression
         gender="neutral",
+        flat_hand_mean=False,
     ):
         self.human_model_path = human_model_path
         self.shape_param_dim = shape_param_dim
         self.expr_param_dim = expr_param_dim
         self.gender = gender
+        self.flat_hand_mean = bool(flat_hand_mean)
 
         self._init_smplx_layers()
         self._load_vertex_indices()
@@ -270,7 +272,7 @@ class EasySMPLX:
                 num_expression_coeffs=100,
                 use_pca=False,
                 use_face_contour=use_face_contour,
-                flat_hand_mean=True,
+                flat_hand_mean=self.flat_hand_mean,
                 **layer_args,
             )
             for gender in ["neutral"]
@@ -422,6 +424,12 @@ def get_parse():
     )
     parser.add_argument("--nodes", default=1, type=int, help="number of workloads")
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument(
+        "--flat-hand-mean",
+        action="store_true",
+        default=False,
+        help="Use SMPL-X flat_hand_mean=True. Default keeps curved MANO mean hands for zero hand poses.",
+    )
 
     args = parser.parse_args()
 
@@ -468,7 +476,12 @@ if __name__ == "__main__":
         **kwargs,
     )
 
-    smplx_model = EasySMPLX("./pretrained_models/human_model_files", 10, 100)
+    smplx_model = EasySMPLX(
+        "./pretrained_models/human_model_files",
+        10,
+        100,
+        flat_hand_mean=opt.flat_hand_mean,
+    )
     smplx_model.to("cuda")
 
     available_items = np.arange(len(dataset))

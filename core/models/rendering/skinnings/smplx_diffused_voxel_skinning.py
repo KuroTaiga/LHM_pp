@@ -45,6 +45,7 @@ class SMPLXDiffusedVoxelSkinning(SMPLXVoxelSkinning):
         body_face_ratio=3,
         dense_sample_points=40000,
         apply_pose_blendshape=False,
+        flat_hand_mean=False,
         voxel_weights_path="./pretrained_models/voxel_grid/cano_1_volume.npz",
     ):
         """
@@ -80,6 +81,7 @@ class SMPLXDiffusedVoxelSkinning(SMPLXVoxelSkinning):
             body_face_ratio,
             dense_sample_points,
             apply_pose_blendshape,
+            flat_hand_mean,
         )
 
     def _voxel_skinning_init(self, *args, **kwargs):

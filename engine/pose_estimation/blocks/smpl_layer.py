@@ -31,6 +31,7 @@ class SMPL_Layer(nn.Module):
         num_betas=10,
         kid=False,
         person_center=None,
+        flat_hand_mean=False,
         *args,
         **kwargs,
     ):
@@ -41,12 +42,13 @@ class SMPL_Layer(nn.Module):
         self.type = type
         self.kid = kid
         self.num_betas = num_betas
+        self.flat_hand_mean = bool(flat_hand_mean)
         self.bm_x = smplx.create(
             smpl_dir,
             "smplx",
             gender=gender,
             use_pca=False,
-            flat_hand_mean=True,
+            flat_hand_mean=self.flat_hand_mean,
             num_betas=num_betas,
         )
 

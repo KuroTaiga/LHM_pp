@@ -69,6 +69,7 @@ class SMPLXVoxelSkinning(nn.Module):
         body_face_ratio=3,
         dense_sample_points=40000,
         apply_pose_blendshape=False,
+        flat_hand_mean=False,
     ):
         """
         Initialize the SMPLXVoxelSkinning module for voxel-based skinning of SMPL-X and FLAME2019 human models.
@@ -99,6 +100,7 @@ class SMPLXVoxelSkinning(nn.Module):
             expr_param_dim=expr_param_dim,
             subdivide_num=subdivide_num,
             cano_pose_type=cano_pose_type,
+            flat_hand_mean=flat_hand_mean,
         )
 
         self.smplx_layer = copy.deepcopy(self.base_skinning.layer[gender])
@@ -118,6 +120,7 @@ class SMPLXVoxelSkinning(nn.Module):
             "body_face_ratio": body_face_ratio,
             "dense_sample_points": dense_sample_points,
             "apply_pose_blendshape": apply_pose_blendshape,
+            "flat_hand_mean": flat_hand_mean,
         }
 
     def compute_verts_normal(self, verts, faces):

@@ -101,7 +101,7 @@ TORSO_JOINT_NAMES = (
     "left_shoulder",
     "right_shoulder",
 )
-_VIDEO_CAMERA_SMPLX_LAYER_CACHE: dict[str, Any] = {}
+_VIDEO_CAMERA_SMPLX_LAYER_CACHE: dict[tuple[str, bool], Any] = {}
 DEFAULT_VIDEO_VIEW_VARIANTS = ("front", "back", "side90", "orbit360")
 VIDEO_VIEW_VARIANT_FILENAMES = {
     "front": "preview.mp4",
@@ -363,6 +363,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default="cuda",
         help="Device for model and tensors.",
+    )
+    parser.add_argument(
+        "--flat-hand-mean",
+        action="store_true",
+        default=False,
+        help="Use SMPL-X flat_hand_mean=True. Default keeps curved MANO mean hands for zero hand poses.",
     )
     parser.add_argument(
         "--video_fps",
@@ -747,9 +753,12 @@ def _parse_video_view_variants(spec: str) -> list[str]:
     return variants
 
 
-def _get_video_camera_smplx_layer(human_model_path: str):
+def _get_video_camera_smplx_layer(
+    human_model_path: str,
+    flat_hand_mean: bool = False,
+):
     """Build or reuse a lightweight SMPL-X layer for preview camera framing."""
-    cache_key = os.path.abspath(human_model_path)
+    cache_key = (os.path.abspath(human_model_path), bool(flat_hand_mean))
     if cache_key not in _VIDEO_CAMERA_SMPLX_LAYER_CACHE:
         from core.models.rendering.smplx import smplx
 
@@ -773,7 +782,7 @@ def _get_video_camera_smplx_layer(human_model_path: str):
             num_expression_coeffs=100,
             use_pca=False,
             use_face_contour=False,
-            flat_hand_mean=True,
+            flat_hand_mean=bool(flat_hand_mean),
             **layer_arg,
         )
     return _VIDEO_CAMERA_SMPLX_LAYER_CACHE[cache_key]
@@ -802,6 +811,7 @@ def _compute_preview_camera_from_first_frame_torso(
     human_model_path: str,
     distance_m: float,
     fill_ratio: float,
+    flat_hand_mean: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Analyze the first frame and body geometry for preview-camera construction."""
     from core.models.rendering.smplx.smplx.joint_names import JOINT_NAMES
@@ -812,7 +822,10 @@ def _compute_preview_camera_from_first_frame_torso(
     smplx_params = _unbatch_motion_smplx_params(motion_seq["smplx_params"])
     device = smplx_params["body_pose"].device
     dtype = smplx_params["body_pose"].dtype
-    smplx_layer = _get_video_camera_smplx_layer(human_model_path).to(device)
+    smplx_layer = _get_video_camera_smplx_layer(
+        human_model_path,
+        flat_hand_mean=flat_hand_mean,
+    ).to(device)
 
     num_frames = int(smplx_params["body_pose"].shape[0])
     expr = smplx_params.get(
@@ -1030,6 +1043,7 @@ def _apply_sequence_preview_camera_mode(
     distance_m: float,
     fill_ratio: float,
     view_variants: list[str],
+    flat_hand_mean: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Return preview-render motion sequences keyed by output filename."""
     if camera_mode == "legacy":
@@ -1040,6 +1054,7 @@ def _apply_sequence_preview_camera_mode(
         human_model_path=human_model_path,
         distance_m=distance_m,
         fill_ratio=fill_ratio,
+        flat_hand_mean=flat_hand_mean,
     )
     previews: dict[str, dict[str, Any]] = {}
     for variant in view_variants:
@@ -1437,6 +1452,7 @@ def run_pose_sequence_export(
     video_camera_distance: float,
     video_camera_fill_ratio: float,
     video_view_variants: list[str],
+    flat_hand_mean: bool = False,
 ) -> None:
     """Export a canonical PLY, frame-wise posed PLYs, and a preview MP4 for a pose JSON folder."""
     out_dir = os.path.abspath(output_dir)
@@ -1473,6 +1489,7 @@ def run_pose_sequence_export(
         distance_m=video_camera_distance,
         fill_ratio=video_camera_fill_ratio,
         view_variants=video_view_variants,
+        flat_hand_mean=flat_hand_mean,
     )
     video_outputs: list[str] = []
     for video_name, preview_motion_seq in preview_motion_seqs.items():
@@ -1530,6 +1547,7 @@ def setup_loaders_and_inputs(args: argparse.Namespace):
 
     _ = Accelerator()
     cfg, _ = parse_app_configs(model_cards)
+    cfg.flat_hand_mean = bool(getattr(args, "flat_hand_mean", False))
 
     model = build_app_model(cfg)
     model.to(device)
@@ -1628,6 +1646,7 @@ def main() -> None:
             video_camera_distance=args.video_camera_distance,
             video_camera_fill_ratio=args.video_camera_fill_ratio,
             video_view_variants=video_view_variants,
+            flat_hand_mean=args.flat_hand_mean,
         )
     else:
         run_tpose_export(
@@ -1642,3 +1661,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+#python scripts/inference/to_gs_ply.py --model_name LHMPP-700M-SMPLX-FREE --output "./outputs/GPT_walking0hands/" --image_glob "./assets/GPT/asian_*.png" --pose_dir "../../inputs/motion_seq_cleaned/walk_fbx_zero_hands/" --video_renderer gs --video_fps 10
