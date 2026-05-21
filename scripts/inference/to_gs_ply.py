@@ -50,6 +50,77 @@ from PIL import Image
 torch._dynamo.config.disable = True
 
 
+def _normalize_hand_pose_mode(hand_pose: str | None) -> str:
+    if hand_pose is None:
+        return DEFAULT_HAND_POSE
+    mode = str(hand_pose).strip().lower()
+    aliases = {
+        "mano_mean": "mano",
+        "mean": "mano",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in HAND_POSE_CHOICES:
+        raise ValueError(
+            f"Unsupported hand pose mode {hand_pose!r}. Expected one of: {', '.join(HAND_POSE_CHOICES)}"
+        )
+    return mode
+
+
+def _hand_pose_uses_flat_hand_mean(hand_pose: str) -> bool:
+    return _normalize_hand_pose_mode(hand_pose) == "zero"
+
+
+def _resolve_cli_hand_pose(args: argparse.Namespace) -> str:
+    raw_hand_pose = getattr(args, "hand_pose", None)
+    if raw_hand_pose is not None:
+        return _normalize_hand_pose_mode(raw_hand_pose)
+
+    legacy_flat = getattr(args, "flat_hand_mean_legacy", None)
+    if legacy_flat is not None:
+        return "zero" if bool(legacy_flat) else "mano"
+
+    return DEFAULT_HAND_POSE
+
+
+def _template_to_hand_pose_tensor(
+    template: tuple[tuple[float, float, float], ...],
+    ref_tensor: torch.Tensor,
+) -> torch.Tensor:
+    pose = torch.tensor(template, dtype=ref_tensor.dtype, device=ref_tensor.device)
+    for _ in range(ref_tensor.dim() - 2):
+        pose = pose.unsqueeze(0)
+    return pose.expand(ref_tensor.shape).clone()
+
+
+def _resolved_hand_pose_tensors(
+    hand_pose: str,
+    lhand_ref: torch.Tensor,
+    rhand_ref: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    mode = _normalize_hand_pose_mode(hand_pose)
+    if mode in {"zero", "mano"}:
+        return torch.zeros_like(lhand_ref), torch.zeros_like(rhand_ref)
+    if mode == "fist":
+        return (
+            _template_to_hand_pose_tensor(FIST_LEFT_HAND_POSE_TEMPLATE, lhand_ref),
+            _template_to_hand_pose_tensor(FIST_RIGHT_HAND_POSE_TEMPLATE, rhand_ref),
+        )
+    return lhand_ref, rhand_ref
+
+
+def _apply_hand_pose_mode_to_smplx_params(
+    smplx_params: dict[str, torch.Tensor],
+    hand_pose: str,
+) -> None:
+    lhand_pose, rhand_pose = _resolved_hand_pose_tensors(
+        hand_pose,
+        smplx_params["lhand_pose"],
+        smplx_params["rhand_pose"],
+    )
+    smplx_params["lhand_pose"] = lhand_pose
+    smplx_params["rhand_pose"] = rhand_pose
+
+
 def _load_module(unique_name: str, rel_path: str) -> Any:
     """Load a project module by path.
 
@@ -76,6 +147,43 @@ from core.utils.model_card import (
 )
 from core.utils.model_download_utils import AutoModelQuery
 from core.utils.video import images_to_video
+
+HAND_POSE_CHOICES = ("zero", "mano", "fist", "auto")
+DEFAULT_HAND_POSE = "mano"
+FIST_LEFT_HAND_POSE_TEMPLATE: tuple[tuple[float, float, float], ...] = (
+    (0.04958100616931915, 0.36835014820098877, -0.637739896774292),
+    (0.16458238661289215, -0.058578114956617355, -0.8480808138847351),
+    (-0.07298103719949722, -0.14415931701660156, -0.24486680328845978),
+    (-0.21128392219543457, 0.18673498928546906, -0.9587481021881104),
+    (-0.12493588030338287, 0.03318280726671219, -0.6680261492729187),
+    (-0.024983355775475502, -0.13423354923725128, -0.4115668535232544),
+    (-0.4745016396045685, -0.6263219118118286, -0.6493027806282043),
+    (-0.27402010560035706, -0.06365421414375305, -0.5441932678222656),
+    (-0.48160916566848755, -0.05523259565234184, -0.18506421148777008),
+    (-0.14952483773231506, -0.16448946297168732, -0.9221172332763672),
+    (-0.3625084161758423, -0.10627639293670654, -0.6032664179801941),
+    (-0.23977230489253998, -0.11663471907377243, -0.46719563007354736),
+    (0.8574790954589844, 0.4635658264160156, -0.0035303146578371525),
+    (-0.5455551147460938, 0.06457393616437912, -0.117129385471344),
+    (0.6235769391059875, 0.22024664282798767, -0.18538440763950348),
+)
+FIST_RIGHT_HAND_POSE_TEMPLATE: tuple[tuple[float, float, float], ...] = (
+    (0.05632118880748749, -0.3765466511249542, 0.5164269804954529),
+    (0.16988682746887207, 0.07110544294118881, 0.6847339272499084),
+    (-0.08403849601745605, 0.13323411345481873, 0.15037938952445984),
+    (-0.2170029580593109, -0.1648358255624771, 0.8093753457069397),
+    (-0.11947973817586899, -0.028554081916809082, 0.5459026098251343),
+    (-0.030956672504544258, 0.12896808981895447, 0.3493155837059021),
+    (-0.5047609210014343, 0.5921298861503601, 0.5138765573501587),
+    (-0.18371249735355377, 0.07510504871606827, 0.4695243239402771),
+    (-0.46872478723526, 0.04282397776842117, 0.08168969303369522),
+    (-0.14294016361236572, 0.15426577627658844, 0.8274692893028259),
+    (-0.34321168065071106, 0.144391268491745, 0.4296301007270813),
+    (-0.22289250791072845, 0.09067293256521225, 0.3789137899875641),
+    (0.8020673394203186, -0.5666137933731079, 0.013887847773730755),
+    (-0.5542587637901306, -0.06527034193277359, 0.05873194336891174),
+    (0.6130924820899963, -0.13785383105278015, 0.1832427829504013),
+)
 
 
 FRAME_VARYING_SMPLX_KEYS = (
@@ -365,10 +473,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Device for model and tensors.",
     )
     parser.add_argument(
+        "--hand-pose",
+        type=str.lower,
+        choices=HAND_POSE_CHOICES,
+        default=None,
+        help=(
+            "Hand override mode. "
+            '"zero" forces zero hand coefficients with SMPL-X flat-hand mean; '
+            '"mano" forces zero coefficients with curved MANO mean hands; '
+            '"fist" forces a fixed closed-fist preset; '
+            '"auto" keeps the hand pose from the SMPL-X JSONs without overwriting it. '
+            f"Default: {DEFAULT_HAND_POSE}."
+        ),
+    )
+    parser.add_argument(
         "--flat-hand-mean",
+        dest="flat_hand_mean_legacy",
         action="store_true",
-        default=False,
-        help="Use SMPL-X flat_hand_mean=True. Default keeps curved MANO mean hands for zero hand poses.",
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--video_fps",
@@ -1135,6 +1258,7 @@ def build_tpose_smplx_params(
     merged_betas: torch.Tensor,
     device: torch.device,
     dtype: torch.dtype,
+    hand_pose: str,
 ) -> dict[str, torch.Tensor]:
     """One-frame T-pose SMPL-X dict: canonical pose + merged betas + neutral transform."""
     sp: dict[str, torch.Tensor] = {}
@@ -1147,15 +1271,17 @@ def build_tpose_smplx_params(
     )
 
     z31 = torch.zeros(1, 1, 3, device=device, dtype=dtype)
-    z_hand = torch.zeros(1, 1, 15, 3, device=device, dtype=dtype)
     n_expr = sp["expr"].shape[-1]
     sp["root_pose"] = z31
     sp["body_pose"] = cano_body_pose_template(device, dtype)
     sp["jaw_pose"] = z31
     sp["leye_pose"] = z31
     sp["reye_pose"] = z31
-    sp["lhand_pose"] = z_hand
-    sp["rhand_pose"] = z_hand
+    sp["lhand_pose"], sp["rhand_pose"] = _resolved_hand_pose_tensors(
+        hand_pose,
+        sp["lhand_pose"],
+        sp["rhand_pose"],
+    )
     sp["trans"] = z31
     sp["expr"] = torch.zeros(1, 1, n_expr, device=device, dtype=dtype)
     return sp
@@ -1167,6 +1293,7 @@ def build_animation_frame_smplx_params(
     merged_betas: torch.Tensor,
     device: torch.device,
     dtype: torch.dtype,
+    hand_pose: str,
 ) -> dict[str, torch.Tensor]:
     """First-frame motion SMPL-X for GS export (clip frame 0 pose, not canonical T-pose)."""
     sp: dict[str, torch.Tensor] = {}
@@ -1176,6 +1303,11 @@ def build_animation_frame_smplx_params(
     sp["betas"] = merged_betas.to(device=device, dtype=dtype)
     sp["transform_mat_neutral_pose"] = transform_mat_neutral_pose.to(
         device=device, dtype=dtype
+    )
+    sp["lhand_pose"], sp["rhand_pose"] = _resolved_hand_pose_tensors(
+        hand_pose,
+        sp["lhand_pose"],
+        sp["rhand_pose"],
     )
     return sp
 
@@ -1266,6 +1398,7 @@ def _export_gaussian_model(
     output_ply: str,
     *,
     export_animation_pose: bool,
+    hand_pose: str,
 ) -> None:
     """Save one canonical or posed Gaussian PLY using cached ``infer_single_view`` outputs."""
     dtype = infer_ctx.merged_betas.dtype
@@ -1276,6 +1409,7 @@ def _export_gaussian_model(
             infer_ctx.merged_betas,
             infer_ctx.device,
             dtype,
+            hand_pose,
         )
     else:
         gs_smplx = build_tpose_smplx_params(
@@ -1284,6 +1418,7 @@ def _export_gaussian_model(
             infer_ctx.merged_betas,
             infer_ctx.device,
             dtype,
+            hand_pose,
         )
 
     render_c2ws = motion_seq_one["render_c2ws"].to(infer_ctx.device)
@@ -1418,6 +1553,7 @@ def run_tpose_export(
     output_ply: str,
     *,
     export_animation_pose: bool = False,
+    hand_pose: str = DEFAULT_HAND_POSE,
 ) -> None:
     """``infer_single_view`` → ``inference_gs`` → ``GaussianModel.save_ply``.
 
@@ -1435,6 +1571,7 @@ def run_tpose_export(
         motion_one,
         output_ply,
         export_animation_pose=export_animation_pose,
+        hand_pose=hand_pose,
     )
 
 
@@ -1452,7 +1589,7 @@ def run_pose_sequence_export(
     video_camera_distance: float,
     video_camera_fill_ratio: float,
     video_view_variants: list[str],
-    flat_hand_mean: bool = False,
+    hand_pose: str = DEFAULT_HAND_POSE,
 ) -> None:
     """Export a canonical PLY, frame-wise posed PLYs, and a preview MP4 for a pose JSON folder."""
     out_dir = os.path.abspath(output_dir)
@@ -1468,6 +1605,7 @@ def run_pose_sequence_export(
         canonical_motion,
         cano_path,
         export_animation_pose=False,
+        hand_pose=hand_pose,
     )
 
     for frame_idx in range(frame_count):
@@ -1479,6 +1617,7 @@ def run_pose_sequence_export(
             frame_motion,
             frame_path,
             export_animation_pose=True,
+            hand_pose=hand_pose,
         )
 
     human_model_path = os.path.join(_LHM_ROOT, "pretrained_models", "human_model_files")
@@ -1489,7 +1628,7 @@ def run_pose_sequence_export(
         distance_m=video_camera_distance,
         fill_ratio=video_camera_fill_ratio,
         view_variants=video_view_variants,
-        flat_hand_mean=flat_hand_mean,
+        flat_hand_mean=_hand_pose_uses_flat_hand_mean(hand_pose),
     )
     video_outputs: list[str] = []
     for video_name, preview_motion_seq in preview_motion_seqs.items():
@@ -1530,6 +1669,7 @@ def setup_loaders_and_inputs(args: argparse.Namespace):
 
     device = args.device
     dtype = torch.float32
+    hand_pose = _resolve_cli_hand_pose(args)
 
     prior_model_check(save_dir="./pretrained_models")
     model_config = MODEL_CONFIG[args.model_name]
@@ -1547,7 +1687,8 @@ def setup_loaders_and_inputs(args: argparse.Namespace):
 
     _ = Accelerator()
     cfg, _ = parse_app_configs(model_cards)
-    cfg.flat_hand_mean = bool(getattr(args, "flat_hand_mean", False))
+    cfg.flat_hand_mean = _hand_pose_uses_flat_hand_mean(hand_pose)
+    cfg.hand_pose = hand_pose
 
     model = build_app_model(cfg)
     model.to(device)
@@ -1601,6 +1742,7 @@ def setup_loaders_and_inputs(args: argparse.Namespace):
     smplx_params = motion_seqs["smplx_params"].copy()
     if pose_estimator is not None:
         smplx_params["betas"] = torch.tensor(shape_pose.beta, dtype=dtype, device=device).unsqueeze(0)
+    _apply_hand_pose_mode_to_smplx_params(smplx_params, hand_pose)
     motion_seqs["smplx_params"] = smplx_params
 
     return model, cfg, ref_imgs_tensor, smplx_params, motion_seqs, pose_estimator, device
@@ -1609,6 +1751,7 @@ def setup_loaders_and_inputs(args: argparse.Namespace):
 def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
+    args.hand_pose = _resolve_cli_hand_pose(args)
     if args.output is None:
         args.output = default_export_output_path(args)
     pose_mode = _pose_input_mode(args)
@@ -1646,7 +1789,7 @@ def main() -> None:
             video_camera_distance=args.video_camera_distance,
             video_camera_fill_ratio=args.video_camera_fill_ratio,
             video_view_variants=video_view_variants,
-            flat_hand_mean=args.flat_hand_mean,
+            hand_pose=args.hand_pose,
         )
     else:
         run_tpose_export(
@@ -1656,6 +1799,7 @@ def main() -> None:
             device=device,
             output_ply=os.path.abspath(args.output),
             export_animation_pose=pose_mode == "single_pose",
+            hand_pose=args.hand_pose,
         )
 
 
