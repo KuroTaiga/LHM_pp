@@ -25,6 +25,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from core.models.rendering.numpy_compat import ensure_numpy_legacy_aliases
 from .lbs import lbs, vertices2landmarks, find_dynamic_lmk_idx_and_bcoords, blend_shapes
 
 from .vertex_ids import vertex_ids as VERTEX_IDS
@@ -42,6 +43,8 @@ from .utils import (
     find_joint_kin_chain,
 )
 from .vertex_joint_selector import VertexJointSelector
+
+ensure_numpy_legacy_aliases()
 
 
 class SMPL(nn.Module):

@@ -476,7 +476,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--hand-pose",
         type=str.lower,
         choices=HAND_POSE_CHOICES,
-        default=None,
+        default="auto",
         help=(
             "Hand override mode. "
             '"zero" forces zero hand coefficients with SMPL-X flat-hand mean; '
@@ -1069,8 +1069,96 @@ def _fit_preview_camera_path(
     img_size_wh = torch.tensor([float(width), float(height)], dtype=vertices.dtype, device=vertices.device)
     return c2ws, intr, img_size_wh
 
+def _look_at_c2w(
+    eye: torch.Tensor,
+    target: torch.Tensor,
+    up: torch.Tensor,
+) -> torch.Tensor:
+    """Build camera-to-world matrix. Camera looks from eye to target."""
+    dtype = eye.dtype
+    device = eye.device
+
+    forward = _normalize_vec(
+        target - eye,
+        torch.tensor([0.0, 0.0, 1.0], device=device, dtype=dtype),
+    )
+
+    right = torch.cross(forward, up, dim=0)
+    right = _normalize_vec(
+        right,
+        torch.tensor([1.0, 0.0, 0.0], device=device, dtype=dtype),
+    )
+
+    true_up = torch.cross(right, forward, dim=0)
+    true_up = _normalize_vec(
+        true_up,
+        torch.tensor([0.0, 1.0, 0.0], device=device, dtype=dtype),
+    )
+
+    c2w = torch.eye(4, dtype=dtype, device=device)
+
+    # camera local axes in world coordinates
+    c2w[:3, 0] = right
+    c2w[:3, 1] = true_up
+    c2w[:3, 2] = forward
+    c2w[:3, 3] = eye
+    return c2w
+
 
 def _build_preview_camera_positions(
+    camera_state: dict[str, torch.Tensor],
+    *,
+    variant: str,
+    num_frames: int,
+) -> torch.Tensor:
+    """Build camera-to-world transforms that actually look at the avatar."""
+    target = camera_state["rotation_center"]
+    up_dir = camera_state["up_dir"]
+    distance = float(camera_state["distance_m"].item())
+    dtype = target.dtype
+    device = target.device
+
+    # 这里假设：人体 up 是 neck-pelvis；前后方向先用世界 Z 轴。
+    # 如果 front/back 反了，只需要交换 +Z / -Z。
+    if variant == "back":
+        view_dirs = torch.tensor([[0.0, -1.0, 0.0]], dtype=dtype, device=device).repeat(num_frames, 1)
+    elif variant == "front":
+        view_dirs = torch.tensor([[0.0, 1.0, 0.0]], dtype=dtype, device=device).repeat(num_frames, 1)
+    elif variant == "side90":
+        view_dirs = torch.tensor([[1.0, 0.0, 0.0]], dtype=dtype, device=device).repeat(num_frames, 1)
+    elif variant == "orbit360":
+        angles = torch.linspace(
+            0.0,
+            2.0 * math.pi,
+            num_frames + 1,
+            device=device,
+            dtype=dtype,
+        )[:-1]
+        view_dirs = torch.stack(
+            [
+                torch.sin(angles),
+                -torch.cos(angles),
+                torch.zeros_like(angles),
+                
+            ],
+            dim=-1,
+        )
+    else:
+        raise ValueError(f"Unsupported preview variant: {variant}")
+
+    c2ws = torch.eye(4, dtype=dtype, device=device).unsqueeze(0).repeat(num_frames, 1, 1)
+
+    for i in range(num_frames):
+        view_dir = _normalize_vec(
+            view_dirs[i],
+            torch.tensor([0.0, 0.0, 1.0], device=device, dtype=dtype),
+        )
+
+        eye = target + view_dir * distance
+        c2ws[i] = _look_at_c2w(eye, target, up_dir)
+
+    return c2ws
+'''def _build_preview_camera_positions(
     camera_state: dict[str, torch.Tensor],
     *,
     variant: str,
@@ -1108,7 +1196,7 @@ def _build_preview_camera_positions(
     c2ws = torch.eye(4, dtype=dtype, device=device).unsqueeze(0).repeat(num_frames, 1, 1)
     c2ws[:, :3, :3] = rotations
     c2ws[:, :3, 3] = camera_positions
-    return c2ws
+    return c2ws'''
 
 
 def _build_preview_motion_seq_variant(
@@ -1239,16 +1327,21 @@ def slice_motion_seq_to_single_frame(
 
 
 def cano_body_pose_template(
-    device: torch.device | str, dtype: torch.dtype
+    default_pose: str, device: torch.device | str, dtype: torch.dtype
 ) -> torch.Tensor:
     """Same canonical body_pose tweaks as ``BaseGSRender._prepare_smplx_data`` (last frame)."""
     bp = torch.zeros(1, 1, 21, 3, device=device, dtype=dtype)
-    # leg
-    bp[0, 0, 0, -1] = math.pi / 12
-    bp[0, 0, 1, -1] = -math.pi / 12
-    # hands
-    bp[0, 0, 15, -1] = -math.pi / 6
-    bp[0, 0, 16, -1] = math.pi / 6
+    if default_pose== "a":
+        # leg
+        bp[0, 0, 0, -1] = math.pi / 12
+        bp[0, 0, 1, -1] = -math.pi / 12
+        # arms
+        bp[0, 0, 15, -1] = -math.pi / 6
+        bp[0, 0, 16, -1] = math.pi / 6
+    else:
+        # arms
+        bp[0, 0, 15, -1] = -math.pi / 2
+        bp[0, 0, 16, -1] = math.pi / 2
     return bp
 
 
@@ -1259,6 +1352,7 @@ def build_tpose_smplx_params(
     device: torch.device,
     dtype: torch.dtype,
     hand_pose: str,
+    default_pose="t" #default to "t" pose; unless we set to "a", which represents the Apose, we use t pose
 ) -> dict[str, torch.Tensor]:
     """One-frame T-pose SMPL-X dict: canonical pose + merged betas + neutral transform."""
     sp: dict[str, torch.Tensor] = {}
@@ -1273,7 +1367,7 @@ def build_tpose_smplx_params(
     z31 = torch.zeros(1, 1, 3, device=device, dtype=dtype)
     n_expr = sp["expr"].shape[-1]
     sp["root_pose"] = z31
-    sp["body_pose"] = cano_body_pose_template(device, dtype)
+    sp["body_pose"] = cano_body_pose_template(default_pose,device, dtype)
     sp["jaw_pose"] = z31
     sp["leye_pose"] = z31
     sp["reye_pose"] = z31

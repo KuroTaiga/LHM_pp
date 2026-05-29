@@ -24,6 +24,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from core.models.rendering.numpy_compat import ensure_numpy_legacy_aliases
 from .lbs import blend_shapes, find_dynamic_lmk_idx_and_bcoords, lbs, vertices2landmarks
 from .utils import (
     Array,
@@ -40,6 +41,8 @@ from .utils import (
 )
 from .vertex_ids import vertex_ids as VERTEX_IDS
 from .vertex_joint_selector import VertexJointSelector
+
+ensure_numpy_legacy_aliases()
 
 TensorOutput = namedtuple(
     "TensorOutput",

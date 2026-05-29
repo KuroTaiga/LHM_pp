@@ -31,8 +31,11 @@ import torch
 from pytorch3d.ops import SubdivideMeshes
 from pytorch3d.structures import Meshes
 
+from core.models.rendering.numpy_compat import ensure_numpy_legacy_aliases
 from core.models.rendering.skinnings.constant import SMPLX_JOINTS
 from core.models.rendering.smplx import smplx
+
+ensure_numpy_legacy_aliases()
 
 
 class BaseSkinning:
