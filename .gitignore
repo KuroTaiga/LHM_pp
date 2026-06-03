@@ -1,6 +1,6 @@
 # Ignore Python cache files
 **/__pycache__
-
+assets/
 # Ignore compiled Python files
 *.pyc
 *.egg
